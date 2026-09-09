@@ -1,0 +1,273 @@
+substitutions:
+name: jk-bms
+friendly_name: "JK-BMS Energy Monitor"
+external_components_source: github://syssi/esphome-jk-bms@main
+mac_address: 20:23:04:33:7B:67
+protocol_version: JK02_32S
+
+esphome:
+name: ${name}
+comment: "Professional Energy Monitoring System"
+project:
+name: "custom.energy-monitor"
+version: 3.1.0
+
+esp32:
+board: esp32dev
+framework:
+type: arduino
+
+external_components:
+- source: ${external_components_source}
+refresh: 0s
+
+wifi:
+ssid: "Re"
+password: "12345679"
+ap:
+ssid: "BMS-Config-AP"
+password: "admin_config"
+
+logger:
+level: DEBUG
+logs:
+esp32_ble_tracker: INFO
+esp32_ble_client: INFO
+
+api:
+
+mqtt:
+broker: broker.mqtt.cool
+port: 1883
+topic_prefix: energy/bms_monitor
+id: mqtt_client
+birth_message:
+topic: energy/bms_monitor/status
+payload: "online"
+will_message:
+topic: energy/bms_monitor/status
+payload: "offline"
+
+esp32_ble_tracker:
+scan_parameters:
+active: false
+
+ble_client:
+- mac_address: ${mac_address}
+id: client0
+
+jk_bms_ble:
+- ble_client_id: client0
+protocol_version: ${protocol_version}
+throttle: 5s
+id: bms0
+
+# =========================================================
+# 1. LOGIKA HYBRID (DUMMY VOLT, AMP, POWER, TEMP)
+# =========================================================
+interval:
+- interval: 2s
+then:
+- lambda: |-
+// Cek status koneksi Bluetooth
+if (!id(bms_online_status).state) {
+// --- 1. GENERATE DUMMY DASAR ---
+float fake_volt = (float)random(2580, 2650) / 100.0; // 25.8 - 26.5 V
+float fake_amp = (float)random(-200, 200) / 100.0; // -2.0 - 2.0 A
+int fake_soc = random(40, 60); // 40% - 60%
+// --- 2. HITUNG POWER SECARA LOGIS (P = V * I) ---
+float fake_power = fake_volt * fake_amp;
+
+// --- 3. GENERATE DUMMY SUHU ---
+float fake_mos_temp = (float)random(300, 350) / 10.0; // 30.0 - 35.0 C
+float fake_bat_temp = (float)random(280, 310) / 10.0; // 28.0 - 31.0 C
+// --- 4. KIRIM DATA KE MQTT ---
+// Data Utama
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_total_voltage/state", to_string(fake_volt));
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_current/state", to_string(fake_amp));
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_state_of_charge/state", to_string(fake_soc));
+// Data Power & Suhu (YANG BARU DITAMBAHKAN)
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_power/state", to_string(fake_power));
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_mos_temp/state", to_string(fake_mos_temp));
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_battery_temp_1/state", to_string(fake_bat_temp));
+id(mqtt_client).publish("energy/bms_monitor/sensor/jk-bms_battery_temp_2/state", to_string(fake_bat_temp));
+
+// Data Per-Cell
+float fake_cell = fake_volt / 8.0;
+for (int i = 1; i <= 8; i++) {
+float noise = (float)random(-5, 5) / 1000.0;
+std::string topic = "energy/bms_monitor/sensor/jk-bms_cell_" + to_string(i) + "/state";
+id(mqtt_client).publish(topic, to_string(fake_cell + noise));
+}
+
+// Status Searching
+id(mqtt_client).publish("energy/bms_monitor/status", "searching_device");
+ESP_LOGW("custom_logic", "BT Lost. Mock Data: P=%.1fW, T=%.1fC", fake_power, fake_mos_temp);
+}
+
+# =========================================================
+# 2. BINARY SENSOR
+# =========================================================
+binary_sensor:
+- platform: jk_bms_ble
+jk_bms_ble_id: bms0
+balancing:
+name: "${name} Balancing Active"
+charging:
+name: "${name} Charging Active"
+discharging:
+name: "${name} Discharging Active"
+online_status:
+name: "${name} Connection Status"
+id: bms_online_status
+
+# =========================================================
+# 3. RELAY CONTROL (GPIO 1-8)
+# =========================================================
+switch:
+- platform: gpio
+pin: 32
+name: "Load Control 1"
+id: relay_1
+restore_mode: ALWAYS_OFF
+- platform: gpio
+pin: 33
+name: "Load Control 2"
+id: relay_2
+restore_mode: ALWAYS_OFF
+
+- platform: gpio
+pin: 25
+name: "Load Control 3"
+id: relay_3
+restore_mode: ALWAYS_OFF
+
+- platform: gpio
+pin: 26
+name: "Load Control 4"
+id: relay_4
+restore_mode: ALWAYS_OFF
+
+- platform: gpio
+pin: 19
+name: "Load Control 5"
+id: relay_5
+restore_mode: ALWAYS_OFF
+
+- platform: gpio
+pin: 18
+name: "Load Control 6"
+id: relay_6
+restore_mode: ALWAYS_OFF
+
+- platform: gpio
+pin: 17
+name: "Load Control 7"
+id: relay_7
+restore_mode: ALWAYS_OFF
+
+- platform: gpio
+pin: 16
+name: "Load Control 8"
+id: relay_8
+restore_mode: ALWAYS_OFF
+
+- platform: jk_bms_ble
+charging:
+name: "${name} Charging Switch"
+discharging:
+name: "${name} Discharging Switch"
+balancer:
+name: "${name} Balancer Switch"
+
+- platform: ble_client
+ble_client_id: client0
+name: "${name} Bluetooth Enabler"
+id: ble_client_switch0
+
+# =========================================================
+# 4. SENSOR MONITORING
+# =========================================================
+sensor:
+- platform: jk_bms_ble
+jk_bms_ble_id: bms0
+total_voltage:
+name: "${name} Total Voltage"
+current:
+name: "${name} Current"
+power:
+name: "${name} Power"
+charging_power:
+name: "${name} Charging Power"
+capacity_remaining:
+name: "${name} Capacity Remaining"
+state_of_charge:
+name: "${name} State of Charge"
+balancing_current:
+name: "${name} Balancing Current"
+# Nama ini akan otomatis jadi topic: .../sensor/jk-bms_mos_temp/state
+power_tube_temperature:
+name: "${name} MOS Temp"
+# Nama ini akan jadi: .../sensor/jk-bms_battery_temp_1/state
+temperature_sensor_1:
+name: "${name} Battery Temp 1"
+temperature_sensor_2:
+name: "${name} Battery Temp 2"
+# Saya pendekkan namanya agar topik MQTT lebih bersih
+cell_voltage_1:
+name: "${name} Cell 1"
+cell_voltage_2:
+name: "${name} Cell 2"
+cell_voltage_3:
+name: "${name} Cell 3"
+cell_voltage_4:
+name: "${name} Cell 4"
+cell_voltage_5:
+name: "${name} Cell 5"
+cell_voltage_6:
+name: "${name} Cell 6"
+cell_voltage_7:
+name: "${name} Cell 7"
+cell_voltage_8:
+name: "${name} Cell 8"
+min_cell_voltage:
+name: "${name} Min Cell V"
+max_cell_voltage:
+name: "${name} Max Cell V"
+delta_cell_voltage:
+name: "${name} Delta Cell V"
+average_cell_voltage:
+name: "${name} Avg Cell V"
+charging_cycles:
+name: "${name} Cycles"
+total_runtime:
+name: "${name} Runtime Seconds"
+
+button:
+- platform: jk_bms_ble
+retrieve_settings:
+name: "${name} Force Update Settings"
+
+number:
+- platform: jk_bms_ble
+jk_bms_ble_id: bms0
+cell_count:
+name: "${name} Cell Count Setting"
+total_battery_capacity:
+name: "${name} Capacity Setting"
+balance_trigger_voltage:
+name: "${name} Balance Trig V"
+max_charge_current:
+name: "${name} Max Charge A"
+max_discharge_current:
+name: "${name} Max Discharge A"
+
+text_sensor:
+- platform: jk_bms_ble
+errors:
+name: "${name} Errors"
+total_runtime_formatted:
+name: "${name} Runtime Formatted"
+charge_status:
+name: "${name} Charge Status"
+
