@@ -23,6 +23,7 @@
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledConnected = false;
+volatile bool ota_updating = false;
 
 AsyncWebServer server(80);
 Preferences preferences;
@@ -338,7 +339,9 @@ void setup() {
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
   // OTA Setup
+  ArduinoOTA.setHostname("r-sync");
   ArduinoOTA.onStart([]() {
+    ota_updating = true;
     if (oledConnected) {
       display.clearDisplay();
       display.setCursor(0, 0);
@@ -347,6 +350,7 @@ void setup() {
     }
   });
   ArduinoOTA.onEnd([]() {
+    ota_updating = false;
     if (oledConnected) {
       display.clearDisplay();
       display.setCursor(0, 0);
@@ -367,6 +371,9 @@ void setup() {
       display.printf("%u%%", percentage);
       display.display();
     }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    ota_updating = false;
   });
   ArduinoOTA.begin();
 
@@ -442,6 +449,12 @@ void updateOLED() {
 void loop() {
   ArduinoOTA.handle();
 
+  // Jika sedang OTA, hentikan semua proses lain (tombol, layar, waktu) agar tidak mengganggu transfer
+  if (ota_updating) {
+    delay(10);
+    return;
+  }
+
   bool currentButtonState = digitalRead(BUTTON_PIN);
   if (lastButtonState == HIGH && currentButtonState == LOW) {
     displayPage = (displayPage + 1) % 2;
@@ -450,25 +463,27 @@ void loop() {
   }
   lastButtonState = currentButtonState;
 
-  struct tm timeinfo;
-  bool gotTime = getLocalTime(&timeinfo);
-  
-  if (gotTime) {
-    if (!ntpSynced) {
-      ntpSynced = true;
-      int currentMin = getMinutesFromMidnight(timeinfo.tm_hour, timeinfo.tm_min);
-      reconcileState(1, jobs1, currentMin);
-      reconcileState(2, jobs2, currentMin);
-      manualOverride1 = false;
-      manualOverride2 = false;
-    } else {
-      checkSchedules(timeinfo.tm_hour, timeinfo.tm_min);
-    }
-  }
-
   unsigned long currentMillis = millis();
   if (currentMillis - lastOledUpdate >= 1000) {
     lastOledUpdate = currentMillis;
+    
+    struct tm timeinfo;
+    // Parameter 10ms memastikan proses getLocalTime tidak nge-block loop berlama-lama jika gagal sync
+    bool gotTime = getLocalTime(&timeinfo, 10);
+    
+    if (gotTime) {
+      if (!ntpSynced) {
+        ntpSynced = true;
+        int currentMin = getMinutesFromMidnight(timeinfo.tm_hour, timeinfo.tm_min);
+        reconcileState(1, jobs1, currentMin);
+        reconcileState(2, jobs2, currentMin);
+        manualOverride1 = false;
+        manualOverride2 = false;
+      } else {
+        checkSchedules(timeinfo.tm_hour, timeinfo.tm_min);
+      }
+    }
+    
     updateOLED();
   }
 }
