@@ -15,8 +15,8 @@ const int relayPins[4] = {26, 25, 33, 32};
 const unsigned long relayDurations[4] = {60000, 180000, 300000, 600000}; // Durasi dalam ms (1m, 3m, 5m, 10m)
 
 // Ganti ke LOW jika modul relay yang dipakai berjenis active-low
-#define RELAY_ON HIGH
-#define RELAY_OFF LOW
+#define RELAY_ON LOW
+#define RELAY_OFF HIGH
 
 bool timersStarted = false;
 unsigned long startTime = 0;
