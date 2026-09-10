@@ -22,6 +22,7 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool oledConnected = false;
 
 AsyncWebServer server(80);
 Preferences preferences;
@@ -301,13 +302,16 @@ void setup() {
 
   Wire.begin(21, 22);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
+    Serial.println(F("SSD1306 allocation failed or not connected"));
+    oledConnected = false;
+  } else {
+    oledConnected = true;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Booting...");
+    display.display();
   }
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Booting...");
-  display.display();
 
   loadJobs();
 
@@ -323,38 +327,46 @@ void setup() {
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
   
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("WiFi Connected");
-  display.println(WiFi.localIP());
-  display.display();
+  if (oledConnected) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi Connected");
+    display.println(WiFi.localIP());
+    display.display();
+  }
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
   // OTA Setup
   ArduinoOTA.onStart([]() {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("OTA Updating...");
-    display.display();
+    if (oledConnected) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("OTA Updating...");
+      display.display();
+    }
   });
   ArduinoOTA.onEnd([]() {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("OTA Success!");
-    display.println("Rebooting...");
-    display.display();
+    if (oledConnected) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("OTA Success!");
+      display.println("Rebooting...");
+      display.display();
+    }
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    int percentage = (progress / (total / 100));
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("OTA Progress:");
-    display.drawRect(0, 20, 128, 10, SSD1306_WHITE);
-    display.fillRect(0, 20, (128 * percentage) / 100, 10, SSD1306_WHITE);
-    display.setCursor(0, 35);
-    display.printf("%u%%", percentage);
-    display.display();
+    if (oledConnected) {
+      int percentage = (progress / (total / 100));
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("OTA Progress:");
+      display.drawRect(0, 20, 128, 10, SSD1306_WHITE);
+      display.fillRect(0, 20, (128 * percentage) / 100, 10, SSD1306_WHITE);
+      display.setCursor(0, 35);
+      display.printf("%u%%", percentage);
+      display.display();
+    }
   });
   ArduinoOTA.begin();
 
@@ -365,6 +377,8 @@ void setup() {
 unsigned long lastOledUpdate = 0;
 
 void updateOLED() {
+  if (!oledConnected) return;
+  
   display.clearDisplay();
   display.setCursor(0, 0);
   
