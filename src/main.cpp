@@ -88,6 +88,7 @@ int lastEvaluatedMinute = -1;
 
 bool lastButtonState = HIGH;
 int displayPage = 0;
+void updateOLED();
 
 void setRelay(int channel, bool state) {
   if (channel == 1) {
@@ -249,6 +250,7 @@ void setupAPI() {
 
     doc["relay1"] = getRelay(1) ? "ON" : "OFF";
     doc["relay2"] = getRelay(2) ? "ON" : "OFF";
+    doc["displayPage"] = displayPage;
 
     JsonArray arr1 = doc["jobs1"].to<JsonArray>();
     for (int i = 0; i < MAX_JOBS; i++) {
@@ -271,6 +273,25 @@ void setupAPI() {
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
+  });
+
+  server.on("/api/display", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, (const char*)data, len);
+      if (!error && doc["page"].is<int>()) {
+        int page = doc["page"].as<int>();
+        if (page >= 0 && page <= 1) {
+          displayPage = page;
+        } else {
+          displayPage = (displayPage + 1) % 2;
+        }
+      } else {
+        // Toggle if no specific page requested
+        displayPage = (displayPage + 1) % 2;
+      }
+      updateOLED();
+      request->send(200, "application/json", "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}");
   });
 
   server.on("/api/relay", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
