@@ -1,6 +1,26 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+
+// WiFiManager includes WebServer.h which uses http_parser sequential enums (0,1,2,3...).
+// ESPAsyncWebServer requires powers of 2 (bitmasks) for method filtering.
+#undef HTTP_GET
+#undef HTTP_POST
+#undef HTTP_DELETE
+#undef HTTP_PUT
+#undef HTTP_PATCH
+#undef HTTP_HEAD
+#undef HTTP_OPTIONS
+#undef HTTP_ANY
+#define HTTP_GET     0b00000001
+#define HTTP_POST    0b00000010
+#define HTTP_DELETE  0b00000100
+#define HTTP_PUT     0b00001000
+#define HTTP_PATCH   0b00010000
+#define HTTP_HEAD    0b00100000
+#define HTTP_OPTIONS 0b01000000
+#define HTTP_ANY     0b01111111
+
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
@@ -199,6 +219,20 @@ const long  gmtOffset_sec = 7 * 3600;
 const int   daylightOffset_sec = 0;
 
 void setupAPI() {
+  // Enable CORS headers for Web clients (e.g. Flutter Web, Chrome, Edge)
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
+
+  // Handle preflight OPTIONS requests via onNotFound fallback
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    if (request->method() == HTTP_OPTIONS) {
+      request->send(200);
+    } else {
+      request->send(404, "text/plain", "Not Found");
+    }
+  });
+
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
     JsonDocument doc;
     doc["ip"] = WiFi.localIP().toString();
@@ -318,6 +352,14 @@ void setup() {
 
   WiFiManager wm;
   wm.setCustomHeadElement(custom_svg_logo);
+  
+  if (oledConnected) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Connecting WiFi...");
+    display.println("Portal: R-Sync");
+    display.display();
+  }
   
   bool res = wm.autoConnect("R-Sync");
   if(!res) {
