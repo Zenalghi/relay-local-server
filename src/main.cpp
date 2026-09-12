@@ -45,6 +45,28 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledConnected = false;
 volatile bool ota_updating = false;
 
+// Helper to draw centered Header with divider line
+void drawOledHeader(const char* title) {
+  if (!oledConnected) return;
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  int len = strlen(title);
+  int x = (128 - (len * 6)) / 2;
+  if (x < 0) x = 0;
+  display.setCursor(x, 0);
+  display.print(title);
+  display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
+}
+
+// Helper to draw centered "R-Sync" at the bottom row (y = 56 of 64px) on all screens
+void drawOledFooter() {
+  if (!oledConnected) return;
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(46, 56);
+  display.print("R-Sync");
+}
+
 AsyncWebServer server(80);
 Preferences preferences;
 
@@ -373,8 +395,11 @@ void setup() {
     oledConnected = true;
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("Booting...");
+    drawOledHeader("- SYSTEM START -");
+    display.setCursor(0, 20);
+    display.println("Booting R-Sync...");
+    display.println("Please wait...");
+    drawOledFooter();
     display.display();
   }
 
@@ -386,11 +411,12 @@ void setup() {
     forcePortal = true;
     if (oledConnected) {
       display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println(">> TOMBOL BOOT <<");
+      drawOledHeader("- FACTORY RESET -");
+      display.setCursor(0, 14);
+      display.println("BOOT button pressed!");
       display.println("Resetting Wi-Fi...");
-      display.println("Opening Portal...");
-      display.println("SSID: R-Sync");
+      display.println("Opening AP: R-Sync");
+      drawOledFooter();
       display.display();
     }
     delay(1200);
@@ -399,25 +425,26 @@ void setup() {
   WiFiManager wm;
   wm.setCustomHeadElement(custom_svg_logo);
   
-  // Waktu tunggu mencoba WiFi tersimpan: 60 detik (sangat ideal untuk toleransi booting router pasca mati lampu)
+  // Stored WiFi connection timeout: 60s (ideal tolerance for router boot after blackout)
   wm.setConnectTimeout(60);
-  // Timeout portal AP jika tidak ada aktivitas selama 2 menit (akan restart & coba sambung WiFi lagi)
+  // Portal timeout after 2 minutes of inactivity (auto-restarts to retry WiFi connection)
   wm.setConfigPortalTimeout(120);
 
-  // Callback saat portal aktif (agar layar OLED ter-update)
+  // Callback when AP portal is active
   wm.setAPCallback([](WiFiManager *myWiFiManager) {
     if (oledConnected) {
       display.clearDisplay();
-      display.setCursor(0, 0);
+      drawOledHeader("- CONFIG PORTAL -");
+      display.setCursor(0, 14);
       display.println("WiFi Not Found!");
-      display.println("Mode: AP Portal");
       display.println("SSID: R-Sync");
       display.println("IP: 192.168.4.1");
+      drawOledFooter();
       display.display();
     }
   });
 
-  // Callback saat user selesai memasukkan WiFi baru di portal web
+  // Callback when user saves new WiFi credentials in web portal
   bool wifiConfigured = false;
   wm.setSaveConfigCallback([&wifiConfigured]() {
     wifiConfigured = true;
@@ -425,10 +452,12 @@ void setup() {
 
   if (oledConnected && !forcePortal) {
     display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Connecting WiFi...");
-    display.println("(Maks 60 detik)");
+    drawOledHeader("- WIFI CONNECT -");
+    display.setCursor(0, 14);
+    display.println("Connecting to WiFi...");
+    display.println("Max wait: 60s");
     display.println("Hold BOOT: Reset");
+    drawOledFooter();
     display.display();
   }
 
@@ -445,13 +474,15 @@ void setup() {
     ESP.restart();
   }
 
-  // Jika baru selesai setting WiFi dari portal, reboot bersih otomatis (tidak perlu tekan tombol EN manual!)
+  // Auto clean reboot after saving WiFi from portal
   if (wifiConfigured || forcePortal) {
     if (oledConnected) {
       display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("WiFi Tersimpan!");
+      drawOledHeader("- CONFIG SAVED -");
+      display.setCursor(0, 18);
+      display.println("WiFi Saved!");
       display.println("Restarting ESP32...");
+      drawOledFooter();
       display.display();
     }
     delay(1500);
@@ -463,9 +494,11 @@ void setup() {
   
   if (oledConnected) {
     display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("WiFi Connected");
-    display.println(WiFi.localIP());
+    drawOledHeader("- WIFI CONNECTED -");
+    display.setCursor(0, 18);
+    display.println("Connected to Network!");
+    display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    drawOledFooter();
     display.display();
   }
 
@@ -477,8 +510,11 @@ void setup() {
     ota_updating = true;
     if (oledConnected) {
       display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("OTA Updating...");
+      drawOledHeader("- SYSTEM UPDATE -");
+      display.setCursor(0, 20);
+      display.println("Receiving update...");
+      display.println("Please wait...");
+      drawOledFooter();
       display.display();
     }
   });
@@ -486,9 +522,11 @@ void setup() {
     ota_updating = false;
     if (oledConnected) {
       display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("OTA Success!");
+      drawOledHeader("- SYSTEM UPDATE -");
+      display.setCursor(0, 20);
+      display.println("Update Success!");
       display.println("Rebooting...");
+      drawOledFooter();
       display.display();
     }
   });
@@ -496,17 +534,26 @@ void setup() {
     if (oledConnected) {
       int percentage = (progress / (total / 100));
       display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("OTA Progress:");
-      display.drawRect(0, 20, 128, 10, SSD1306_WHITE);
-      display.fillRect(0, 20, (128 * percentage) / 100, 10, SSD1306_WHITE);
-      display.setCursor(0, 35);
-      display.printf("%u%%", percentage);
+      drawOledHeader("- SYSTEM UPDATE -");
+      display.drawRect(0, 18, 128, 10, SSD1306_WHITE);
+      display.fillRect(0, 18, (128 * percentage) / 100, 10, SSD1306_WHITE);
+      display.setCursor(24, 34);
+      display.printf("Progress: %u%%", percentage);
+      drawOledFooter();
       display.display();
     }
   });
   ArduinoOTA.onError([](ota_error_t error) {
     ota_updating = false;
+    if (oledConnected) {
+      display.clearDisplay();
+      drawOledHeader("- SYSTEM UPDATE -");
+      display.setCursor(0, 20);
+      display.println("Update Failed!");
+      display.println("Reverting changes...");
+      drawOledFooter();
+      display.display();
+    }
   });
   ArduinoOTA.begin();
 
@@ -520,10 +567,13 @@ void updateOLED() {
   if (!oledConnected) return;
   
   display.clearDisplay();
-  display.setCursor(0, 0);
   
   if (displayPage == 0) {
+    // Header
+    drawOledHeader("- DEVICE STATUS -");
+
     // WiFi
+    display.setCursor(0, 13);
     display.print("WiFi: ");
     if (WiFi.status() == WL_CONNECTED) {
       display.println(WiFi.localIP());
@@ -532,50 +582,76 @@ void updateOLED() {
     }
 
     // Time
+    display.setCursor(0, 23);
+    display.print("Time: ");
     struct tm timeinfo;
-    if(getLocalTime(&timeinfo)){
+    if(getLocalTime(&timeinfo, 10)){
       char timeStr[20];
       sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-      display.print("Time: ");
       display.println(timeStr);
     } else {
-      display.println("Time: Syncing...");
+      display.println("Syncing...");
     }
 
     // Relays
-    display.println("");
+    display.setCursor(0, 35);
     display.print("Relay 1: "); display.println(getRelay(1) ? "ON" : "OFF");
+    display.setCursor(0, 45);
     display.print("Relay 2: "); display.println(getRelay(2) ? "ON" : "OFF");
   } else {
-    display.println("- Scheduler List -");
-    display.println("");
-    
-    // Relay 1 jobs
-    display.print("R1:");
-    bool r1HasJob = false;
-    for(int i=0; i<MAX_JOBS; i++) {
-      if(jobs1[i].enabled) {
-        display.printf(" %02d:%02d%c", jobs1[i].hour, jobs1[i].minute, jobs1[i].action ? '+' : '-');
-        r1HasJob = true;
+    // Header
+    drawOledHeader("- SCHEDULER LIST -");
+
+    auto drawScheduleGrid = [](int channel, Job jobs[], int startY) {
+      display.setCursor(0, startY);
+      display.printf("R%d:", channel);
+
+      char items[4][8];
+      int count = 0;
+      for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs[i].enabled) {
+          snprintf(items[count], sizeof(items[count]), "%02d:%02d%c", 
+                   jobs[i].hour, jobs[i].minute, jobs[i].action ? '+' : '-');
+          count++;
+        }
       }
-    }
-    if (!r1HasJob) display.print(" No Sched");
-    display.println();
-    
-    // Relay 2 jobs
-    display.println("");
-    display.print("R2:");
-    bool r2HasJob = false;
-    for(int i=0; i<MAX_JOBS; i++) {
-      if(jobs2[i].enabled) {
-        display.printf(" %02d:%02d%c", jobs2[i].hour, jobs2[i].minute, jobs2[i].action ? '+' : '-');
-        r2HasJob = true;
+
+      if (count == 0) {
+        display.setCursor(24, startY);
+        display.print("No Sched");
+      } else {
+        // Baris 1 (Jadwal 1 & 2)
+        if (count >= 1) {
+          display.setCursor(24, startY);
+          display.print(items[0]);
+        }
+        if (count >= 2) {
+          display.setCursor(76, startY);
+          display.print(items[1]);
+        }
+        // Baris 2 (Jadwal 3 & 4) -> Membentuk tabel 2x2 yang simetris dan rapi
+        if (count >= 3) {
+          display.setCursor(24, startY + 10);
+          display.print(items[2]);
+        }
+        if (count >= 4) {
+          display.setCursor(76, startY + 10);
+          display.print(items[3]);
+        }
       }
-    }
-    if (!r2HasJob) display.print(" No Sched");
-    display.println();
+    };
+
+    // Render Relay 1 (Tabel 2x2)
+    drawScheduleGrid(1, jobs1, 11);
+
+    // Garis pemisah horizontal antara Relay 1 dan Relay 2
+    display.drawFastHLine(0, 31, 128, SSD1306_WHITE);
+
+    // Render Relay 2 (Tabel 2x2)
+    drawScheduleGrid(2, jobs2, 33);
   }
 
+  drawOledFooter();
   display.display();
 }
 
