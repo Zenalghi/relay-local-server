@@ -345,6 +345,15 @@ void setupAPI() {
       }
       request->send(400, "application/json", "{\"status\":\"Error\"}");
   });
+
+  // Endpoint to remotely trigger WiFi configuration portal
+  server.on("/api/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request){
+    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Resetting WiFi credentials. Opening Portal 'R-Sync'...\"}");
+    delay(600);
+    WiFiManager wm;
+    wm.resetSettings();
+    ESP.restart();
+  });
 }
 
 void setup() {
@@ -371,22 +380,83 @@ void setup() {
 
   loadJobs();
 
+  // Check if Boot button (GPIO 0) is pressed at startup for Instant WiFi Reset
+  bool forcePortal = false;
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    forcePortal = true;
+    if (oledConnected) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(">> TOMBOL BOOT <<");
+      display.println("Resetting Wi-Fi...");
+      display.println("Opening Portal...");
+      display.println("SSID: R-Sync");
+      display.display();
+    }
+    delay(1200);
+  }
+
   WiFiManager wm;
   wm.setCustomHeadElement(custom_svg_logo);
   
-  if (oledConnected) {
+  // Waktu tunggu mencoba WiFi tersimpan: 60 detik (sangat ideal untuk toleransi booting router pasca mati lampu)
+  wm.setConnectTimeout(60);
+  // Timeout portal AP jika tidak ada aktivitas selama 2 menit (akan restart & coba sambung WiFi lagi)
+  wm.setConfigPortalTimeout(120);
+
+  // Callback saat portal aktif (agar layar OLED ter-update)
+  wm.setAPCallback([](WiFiManager *myWiFiManager) {
+    if (oledConnected) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("WiFi Not Found!");
+      display.println("Mode: AP Portal");
+      display.println("SSID: R-Sync");
+      display.println("IP: 192.168.4.1");
+      display.display();
+    }
+  });
+
+  // Callback saat user selesai memasukkan WiFi baru di portal web
+  bool wifiConfigured = false;
+  wm.setSaveConfigCallback([&wifiConfigured]() {
+    wifiConfigured = true;
+  });
+
+  if (oledConnected && !forcePortal) {
     display.clearDisplay();
     display.setCursor(0, 0);
     display.println("Connecting WiFi...");
-    display.println("Portal: R-Sync");
+    display.println("(Maks 60 detik)");
+    display.println("Hold BOOT: Reset");
     display.display();
   }
-  
-  bool res = wm.autoConnect("R-Sync");
-  if(!res) {
-    Serial.println("Failed to connect");
+
+  bool res = false;
+  if (forcePortal) {
+    wm.resetSettings();
+    res = wm.startConfigPortal("R-Sync");
+  } else {
+    res = wm.autoConnect("R-Sync");
+  }
+
+  if (!res) {
+    Serial.println("Failed to connect or portal timeout");
     ESP.restart();
-  } 
+  }
+
+  // Jika baru selesai setting WiFi dari portal, reboot bersih otomatis (tidak perlu tekan tombol EN manual!)
+  if (wifiConfigured || forcePortal) {
+    if (oledConnected) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("WiFi Tersimpan!");
+      display.println("Restarting ESP32...");
+      display.display();
+    }
+    delay(1500);
+    ESP.restart();
+  }
 
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
