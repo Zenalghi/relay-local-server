@@ -1,3 +1,13 @@
+/**
+ * @file main.cpp
+ * @brief R-Sync ESP32 Local Server Firmware
+ * @author Zenalghi
+ * 
+ * GitHub Repositories:
+ * - Firmware ESP32: https://github.com/Zenalghi/relay-local-server
+ * - Flutter Client: https://github.com/Zenalghi/r_sync_app
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>

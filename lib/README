@@ -1,46 +1,107 @@
+# R-Sync ESP32 Firmware - Private Libraries Directory (`lib/`)
 
-This directory is intended for project specific (private) libraries.
-PlatformIO will compile them to static libraries and link into the executable file.
+Direktori `lib/` ini disediakan oleh PlatformIO untuk menyimpan pustaka (*custom / private libraries*) modular khusus proyek **R-Sync ESP32 Local Server**.
 
-The source code of each library should be placed in a separate directory
-("lib/your_library_name/[Code]").
+---
 
-For example, see the structure of the following example libraries `Foo` and `Bar`:
+## 🎯 Tujuan Direktori Ini
+Saat ini seluruh *business logic* inti ESP32 berada pada [`src/main.cpp`](../src/main.cpp). Jika di masa mendatang pengembang ingin melakukan refaktorisasi atau memecah modul agar lebih bersih dan terisolasi (*clean architecture*), direktori `lib/` adalah tempat yang tepat untuk meletakkan modul-modul tersebut.
 
-|--lib
-|  |
-|  |--Bar
-|  |  |--docs
-|  |  |--examples
-|  |  |--src
-|  |     |- Bar.c
-|  |     |- Bar.h
-|  |  |- library.json (optional. for custom build options, etc) https://docs.platformio.org/page/librarymanager/config.html
-|  |
-|  |--Foo
-|  |  |- Foo.c
-|  |  |- Foo.h
-|  |
-|  |- README --> THIS FILE
-|
-|- platformio.ini
-|--src
-   |- main.c
+PlatformIO secara otomatis akan mengompilasi setiap folder di dalam `lib/` sebagai pustaka statis (*static library*) dan melakukan *linking* tanpa perlu mengubah `platformio.ini`.
 
-Example contents of `src/main.c` using Foo and Bar:
+---
+
+## 🏛️ Rekomendasi Struktur Modul Modular
+
+Jika ingin memecah [`src/main.cpp`](../src/main.cpp) ke dalam pustaka mandiri, berikut struktur yang disarankan:
+
+```text
+relay-local-server/
+├── lib/
+│   ├── RelayController/          # Modul manajemen pin hardware relay & manual override
+│   │   ├── src/
+│   │   │   ├── RelayController.h
+│   │   │   └── RelayController.cpp
+│   │   └── library.json          (opsional)
+│   │
+│   ├── SchedulerManager/         # Modul evaluasi jadwal harian, NVS persistensi, rekonsiliasi waktu
+│   │   ├── src/
+│   │   │   ├── SchedulerManager.h
+│   │   │   └── SchedulerManager.cpp
+│   │
+│   ├── DisplayOLED/              # Modul rendering antarmuka layar SSD1306 (Status & 2x2 Grid)
+│   │   ├── src/
+│   │   │   ├── DisplayOLED.h
+│   │   │   └── DisplayOLED.cpp
+│   │
+│   └── NetworkServer/            # Modul AsyncWebServer, WiFiManager portal, dan ArduinoOTA
+│       ├── src/
+│       │   ├── NetworkServer.h
+│       │   └── NetworkServer.cpp
+│
+└── src/
+    └── main.cpp                  # Entry point setup() dan loop() yang ringkas
 ```
-#include <Foo.h>
-#include <Bar.h>
 
-int main (void)
-{
-  ...
-}
+---
 
-```
+## 🧩 Panduan Pembuatan Library Baru
 
-The PlatformIO Library Dependency Finder will find automatically dependent
-libraries by scanning project source files.
+1. **Buat Folder**: Buat folder baru di bawah `lib/`, misalnya `lib/RelayController/src/`.
+2. **Header File (`.h`)**:
+   ```cpp
+   #ifndef RELAY_CONTROLLER_H
+   #define RELAY_CONTROLLER_H
 
-More information about PlatformIO Library Dependency Finder
-- https://docs.platformio.org/page/librarymanager/ldf.html
+   #include <Arduino.h>
+
+   class RelayController {
+   public:
+       RelayController(uint8_t pin1, uint8_t pin2);
+       void begin();
+       void setRelay(int channel, bool state);
+       bool getRelay(int channel);
+   private:
+       uint8_t _pin1, _pin2;
+   };
+
+   #endif
+   ```
+3. **Source File (`.cpp`)**:
+   ```cpp
+   #include "RelayController.h"
+
+   RelayController::RelayController(uint8_t pin1, uint8_t pin2) 
+       : _pin1(pin1), _pin2(pin2) {}
+
+   void RelayController::begin() {
+       pinMode(_pin1, OUTPUT);
+       pinMode(_pin2, OUTPUT);
+       setRelay(1, false);
+       setRelay(2, false);
+   }
+
+   void RelayController::setRelay(int channel, bool state) {
+       uint8_t pin = (channel == 1) ? _pin1 : _pin2;
+       digitalWrite(pin, state ? LOW : HIGH); // Active LOW relay
+   }
+
+   bool RelayController::getRelay(int channel) {
+       uint8_t pin = (channel == 1) ? _pin1 : _pin2;
+       return digitalRead(pin) == LOW;
+   }
+   ```
+4. **Panggil di `src/main.cpp`**:
+   ```cpp
+   #include <RelayController.h>
+   RelayController relays(26, 25);
+   ```
+
+---
+
+## 📚 Referensi Resmi
+- **Repositori Firmware ESP32**: [https://github.com/Zenalghi/relay-local-server](https://github.com/Zenalghi/relay-local-server)
+- **Repositori Aplikasi Flutter**: [https://github.com/Zenalghi/r_sync_app](https://github.com/Zenalghi/r_sync_app)
+- Dokumentasi PlatformIO Library Dependency Finder (LDF): https://docs.platformio.org/page/librarymanager/ldf.html
+- Proyek Firmware Utama: [`src/main.cpp`](../src/main.cpp)
+- Konfigurasi Build & Partisi: [`platformio.ini`](../platformio.ini)
