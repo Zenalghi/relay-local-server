@@ -297,26 +297,29 @@ const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 7 * 3600;
 const int daylightOffset_sec = 0;
 
-void setupAPI(){
-  // Enable CORS headers for Web clients (e.g. Flutter Web, Chrome, Edge)
+void setupAPI()
+{
+  // Enable CORS headers
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
 
-  // Handle preflight OPTIONS requests via onNotFound fallback
-  server.onNotFound([](AsyncWebServerRequest *request) {
+  // Preflight handler
+  server.onNotFound([](AsyncWebServerRequest *request)
+                    {
     if (request->method() == HTTP_OPTIONS) {
       request->send(200);
     } else {
-      request->send(404, "text/plain", "Not Found");
+      request->send(404, "application/json", "{\"status\":\"Error\",\"message\":\"Not Found\"}");
     } });
 
+  // 1. GET Status
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
- {
+            {
     JsonDocument doc;
     doc["ip"] = WiFi.localIP().toString();
     doc["wifi"] = WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
-    
+
     struct tm timeinfo;
     if(getLocalTime(&timeinfo)){
       char timeStringBuff[50];
@@ -339,7 +342,7 @@ void setupAPI(){
       obj["a"] = jobs1[i].action ? "ON" : "OFF";
       obj["e"] = jobs1[i].enabled;
     }
-    
+
     JsonArray arr2 = doc["jobs2"].to<JsonArray>();
     for (int i = 0; i < MAX_JOBS; i++) {
       JsonObject obj = arr2.add<JsonObject>();
@@ -353,105 +356,133 @@ void setupAPI(){
     serializeJson(doc, response);
     request->send(200, "application/json", response); });
 
-  server.on("/api/display", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
- {
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, (const char*)data, len);
-      if (!error && doc["page"].is<int>()) {
-        int page = doc["page"].as<int>();
-        if (page >= 0 && page <= 1) {
-          displayPage = page;
-        } else {
+  // 2. POST /api/relay/polarity (Didaftarkan SEBELUM /api/relay agar tidak ter-shadow)
+  server.on(
+      "/api/relay/polarity", HTTP_ANY, [](AsyncWebServerRequest *request) {}, NULL,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+        JsonDocument doc;
+        // Parsing buffer secara eksplisit dengan len (Safe, tanpa null-terminator requirement)
+        DeserializationError error = deserializeJson(doc, data, len);
+
+        if (!error && doc["activeLow"].is<bool>())
+        {
+          bool next = doc["activeLow"].as<bool>();
+          setRelayPolarityAndForceOff(next);
+
+          JsonDocument resp;
+          resp["status"] = "OK";
+          resp["activeLow"] = activeLow;
+          resp["relay1"] = "OFF";
+          resp["relay2"] = "OFF";
+
+          String response;
+          serializeJson(resp, response);
+          request->send(200, "application/json", response);
+          return;
+        }
+
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Polarity\"}");
+      });
+
+  // 3. POST /api/relay
+  server.on(
+      "/api/relay", HTTP_ANY, [](AsyncWebServerRequest *request) {}, NULL,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, data, len);
+
+        if (!error)
+        {
+          int channel = doc["channel"] | 0;
+          String state = doc["state"] | "";
+          if (channel == 1 || channel == 2)
+          {
+            bool st = (state == "ON");
+            setRelay(channel, st);
+            if (channel == 1)
+              manualOverride1 = true;
+            if (channel == 2)
+              manualOverride2 = true;
+            request->send(200, "application/json", "{\"status\":\"OK\"}");
+            return;
+          }
+        }
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Relay\"}");
+      });
+
+  // 4. POST /api/display
+  server.on(
+      "/api/display", HTTP_ANY, [](AsyncWebServerRequest *request) {}, NULL,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, data, len);
+
+        if (!error && doc["page"].is<int>())
+        {
+          int page = doc["page"].as<int>();
+          if (page >= 0 && page <= 1)
+          {
+            displayPage = page;
+          }
+          else
+          {
+            displayPage = (displayPage + 1) % 2;
+          }
+        }
+        else
+        {
           displayPage = (displayPage + 1) % 2;
         }
-      } else {
-        // Toggle if no specific page requested
-        displayPage = (displayPage + 1) % 2;
-      }
-      updateOLED();
-      request->send(200, "application/json", "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}"); });
+        updateOLED();
+        request->send(200, "application/json", "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}");
+      });
 
-  server.on("/api/relay", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
- {
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, (const char*)data, len);
-      if (!error) {
-        int channel = doc["channel"] | 0;
-        String state = doc["state"] | "";
-        if (channel == 1 || channel == 2) {
-          bool st = (state == "ON");
-          setRelay(channel, st);
-          if (channel == 1) manualOverride1 = true;
-          if (channel == 2) manualOverride2 = true;
-          request->send(200, "application/json", "{\"status\":\"OK\"}");
-          return;
-        }
-      }
-      request->send(400, "application/json", "{\"status\":\"Error\"}"); });
+  // 5. POST /api/schedule
+  server.on(
+      "/api/schedule", HTTP_ANY, [](AsyncWebServerRequest *request) {}, NULL,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+      {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, data, len);
 
-  server.on("/api/relay/polarity", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
- {
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, (const char*)data, len);
-      if (!error && doc["activeLow"].is<bool>()) {
-        bool next = doc["activeLow"].as<bool>();
-        setRelayPolarityAndForceOff(next);
+        if (!error)
+        {
+          int channel = doc["channel"] | 0;
+          JsonArray arr = doc["jobs"].as<JsonArray>();
 
-        JsonDocument resp;
-        resp["status"] = "OK";
-        resp["activeLow"] = activeLow;
-        resp["relay1"] = "OFF";
-        resp["relay2"] = "OFF";
-        String response;
-        serializeJson(resp, response);
-        request->send(200, "application/json", response);
-        return;
-      }
-      request->send(400, "application/json", "{\"status\":\"Error\"}"); });
-
-  server.on("/api/schedule", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
- {
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, (const char*)data, len);
-      if (!error) {
-        int channel = doc["channel"] | 0;
-        JsonArray arr = doc["jobs"].as<JsonArray>();
-        
-        if (channel == 1) {
-          for (int i = 0; i < MAX_JOBS && i < arr.size(); i++) {
-            jobs1[i].hour = arr[i]["h"] | 0;
-            jobs1[i].minute = arr[i]["m"] | 0;
-            jobs1[i].action = (arr[i]["a"] == "ON");
-            jobs1[i].enabled = arr[i]["e"] | false;
+          if (channel == 1 || channel == 2)
+          {
+            Job *targetJobs = (channel == 1) ? jobs1 : jobs2;
+            for (int i = 0; i < MAX_JOBS && i < arr.size(); i++)
+            {
+              targetJobs[i].hour = arr[i]["h"] | 0;
+              targetJobs[i].minute = arr[i]["m"] | 0;
+              targetJobs[i].action = (arr[i]["a"] == "ON");
+              targetJobs[i].enabled = arr[i]["e"] | false;
+            }
+            saveJobs();
+            request->send(200, "application/json", "{\"status\":\"OK\"}");
+            return;
           }
-          saveJobs();
-          request->send(200, "application/json", "{\"status\":\"OK\"}");
-          return;
-        } else if (channel == 2) {
-          for (int i = 0; i < MAX_JOBS && i < arr.size(); i++) {
-            jobs2[i].hour = arr[i]["h"] | 0;
-            jobs2[i].minute = arr[i]["m"] | 0;
-            jobs2[i].action = (arr[i]["a"] == "ON");
-            jobs2[i].enabled = arr[i]["e"] | false;
-          }
-          saveJobs();
-          request->send(200, "application/json", "{\"status\":\"OK\"}");
-          return;
         }
-      }
-      request->send(400, "application/json", "{\"status\":\"Error\"}"); });
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Schedule\"}");
+      });
 
-  // Endpoint to remotely trigger WiFi configuration portal
-  server.on("/api/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request)
- {
-    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Resetting WiFi credentials. Opening Portal 'R-Sync'...\"}");
+  // 6. Reset WiFi
+  server.on("/api/wifi/reset", HTTP_ANY, [](AsyncWebServerRequest *request)
+            {
+    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Resetting WiFi credentials...\"}");
     delay(600);
     WiFiManager wm;
     wm.resetSettings();
     ESP.restart(); });
 }
 
-void setup(){
+void setup()
+{
   Serial.begin(115200);
 
   pinMode(RELAY1_PIN, OUTPUT);
@@ -483,9 +514,11 @@ void setup(){
 
   // Check if Boot button (GPIO 0) is pressed at startup for Instant WiFi Reset
   bool forcePortal = false;
-  if (digitalRead(BUTTON_PIN) == LOW) {
+  if (digitalRead(BUTTON_PIN) == LOW)
+  {
     forcePortal = true;
-    if (oledConnected) {
+    if (oledConnected)
+    {
       display.clearDisplay();
       drawOledHeader("- FACTORY RESET -");
       display.setCursor(0, 14);
@@ -507,7 +540,8 @@ void setup(){
   wm.setConfigPortalTimeout(120);
 
   // Callback when AP portal is active
-  wm.setAPCallback([](WiFiManager *myWiFiManager) {
+  wm.setAPCallback([](WiFiManager *myWiFiManager)
+                   {
     if (oledConnected) {
       display.clearDisplay();
       drawOledHeader("- CONFIG PORTAL -");
@@ -522,9 +556,10 @@ void setup(){
   // Callback when user saves new WiFi credentials in web portal
   bool wifiConfigured = false;
   wm.setSaveConfigCallback([&wifiConfigured]()
-                { wifiConfigured = true; });
+                           { wifiConfigured = true; });
 
-  if (oledConnected && !forcePortal) {
+  if (oledConnected && !forcePortal)
+  {
     display.clearDisplay();
     drawOledHeader("- WIFI CONNECT -");
     display.setCursor(0, 14);
@@ -536,22 +571,27 @@ void setup(){
   }
 
   bool res = false;
-  if (forcePortal) {
+  if (forcePortal)
+  {
     wm.resetSettings();
     res = wm.startConfigPortal("R-Sync");
   }
-  else {
+  else
+  {
     res = wm.autoConnect("R-Sync");
   }
 
-  if (!res) {
+  if (!res)
+  {
     Serial.println("Failed to connect or portal timeout");
     ESP.restart();
   }
 
   // Auto clean reboot after saving WiFi from portal
-  if (wifiConfigured || forcePortal) {
-    if (oledConnected) {
+  if (wifiConfigured || forcePortal)
+  {
+    if (oledConnected)
+    {
       display.clearDisplay();
       drawOledHeader("- CONFIG SAVED -");
       display.setCursor(0, 18);
@@ -567,7 +607,8 @@ void setup(){
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
 
-  if (oledConnected) {
+  if (oledConnected)
+  {
     display.clearDisplay();
     drawOledHeader("- WIFI CONNECTED -");
     display.setCursor(0, 18);
@@ -582,7 +623,7 @@ void setup(){
   // OTA Setup
   ArduinoOTA.setHostname("r-sync");
   ArduinoOTA.onStart([]()
-          {
+                     {
     ota_updating = true;
     if (oledConnected) {
       display.clearDisplay();
@@ -593,7 +634,8 @@ void setup(){
       drawOledFooter();
       display.display();
     } });
-  ArduinoOTA.onEnd([]() {
+  ArduinoOTA.onEnd([]()
+                   {
     ota_updating = false;
     if (oledConnected) {
       display.clearDisplay();
@@ -604,7 +646,8 @@ void setup(){
       drawOledFooter();
       display.display();
     } });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
+                        {
     if (oledConnected) {
       int percentage = (progress / (total / 100));
       display.clearDisplay();
@@ -617,7 +660,7 @@ void setup(){
       display.display();
     } });
   ArduinoOTA.onError([](ota_error_t error)
-          {
+                     {
     ota_updating = false;
     if (oledConnected) {
       display.clearDisplay();
@@ -636,23 +679,27 @@ void setup(){
 
 unsigned long lastOledUpdate = 0;
 
-void updateOLED(){
+void updateOLED()
+{
   if (!oledConnected)
     return;
 
   display.clearDisplay();
 
-  if (displayPage == 0) {
+  if (displayPage == 0)
+  {
     // Header
     drawOledHeader("- DEVICE STATUS -");
 
     // WiFi
     display.setCursor(0, 13);
     display.print("WiFi: ");
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED)
+    {
       display.println(WiFi.localIP());
     }
-    else {
+    else
+    {
       display.println("Disconnected");
     }
 
@@ -660,12 +707,14 @@ void updateOLED(){
     display.setCursor(0, 23);
     display.print("Time: ");
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 10)) {
+    if (getLocalTime(&timeinfo, 10))
+    {
       char timeStr[20];
       sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
       display.println(timeStr);
     }
-    else {
+    else
+    {
       display.println("Syncing...");
     }
 
@@ -677,44 +726,54 @@ void updateOLED(){
     display.print("Relay 2: ");
     display.println(getRelay(2) ? "ON" : "OFF");
   }
-  else {
+  else
+  {
     // Header
     drawOledHeader("- SCHEDULER LIST -");
 
-    auto drawScheduleGrid = [](int channel, Job jobs[], int startY) {
+    auto drawScheduleGrid = [](int channel, Job jobs[], int startY)
+    {
       display.setCursor(0, startY);
       display.printf("R%d:", channel);
 
       char items[4][8];
       int count = 0;
-      for (int i = 0; i < MAX_JOBS; i++) {
-        if (jobs[i].enabled) {
+      for (int i = 0; i < MAX_JOBS; i++)
+      {
+        if (jobs[i].enabled)
+        {
           snprintf(items[count], sizeof(items[count]), "%02d:%02d%c",
                    jobs[i].hour, jobs[i].minute, jobs[i].action ? '+' : '-');
           count++;
         }
       }
 
-      if (count == 0) {
+      if (count == 0)
+      {
         display.setCursor(24, startY);
         display.print("No Sched");
       }
-      else {
+      else
+      {
         // Baris 1 (Jadwal 1 & 2)
-        if (count >= 1) {
+        if (count >= 1)
+        {
           display.setCursor(24, startY);
           display.print(items[0]);
         }
-        if (count >= 2) {
+        if (count >= 2)
+        {
           display.setCursor(76, startY);
           display.print(items[1]);
         }
         // Baris 2 (Jadwal 3 & 4) -> Membentuk tabel 2x2 yang simetris dan rapi
-        if (count >= 3) {
+        if (count >= 3)
+        {
           display.setCursor(24, startY + 10);
           display.print(items[2]);
         }
-        if (count >= 4) {
+        if (count >= 4)
+        {
           display.setCursor(76, startY + 10);
           display.print(items[3]);
         }
@@ -735,7 +794,8 @@ void updateOLED(){
   display.display();
 }
 
-void drawOledCountdown(int secondsRemaining){
+void drawOledCountdown(int secondsRemaining)
+{
   if (!oledConnected)
     return;
   display.clearDisplay();
@@ -754,19 +814,23 @@ void drawOledCountdown(int secondsRemaining){
   display.display();
 }
 
-void handleButtonPress(){
+void handleButtonPress()
+{
   bool currentButtonState = digitalRead(BUTTON_PIN);
 
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
+  if (lastButtonState == HIGH && currentButtonState == LOW)
+  {
     // Button pressed down
     buttonPressTime = millis();
     isHolding = false;
   }
-  else if (lastButtonState == LOW && currentButtonState == LOW) {
+  else if (lastButtonState == LOW && currentButtonState == LOW)
+  {
     // Button is being held down
     unsigned long duration = millis() - buttonPressTime;
 
-    if (duration >= 1000 && duration < 11000) {
+    if (duration >= 1000 && duration < 11000)
+    {
       isHolding = true;
       int elapsedSeconds = (duration - 1000) / 1000;
       int remaining = 10 - elapsedSeconds;
@@ -774,16 +838,19 @@ void handleButtonPress(){
         remaining = 0;
 
       static int lastDisplayedSec = -1;
-      if (lastDisplayedSec != remaining) {
+      if (lastDisplayedSec != remaining)
+      {
         lastDisplayedSec = remaining;
         drawOledCountdown(remaining);
       }
     }
-    else if (duration >= 11000) {
+    else if (duration >= 11000)
+    {
       // Toggle Polarity Triggered
       setRelayPolarityAndForceOff(!activeLow);
 
-      if (oledConnected) {
+      if (oledConnected)
+      {
         display.clearDisplay();
         drawOledHeader("- TOGGLE POLARITY -");
         display.setTextSize(1);
@@ -801,16 +868,19 @@ void handleButtonPress(){
       updateOLED();
     }
   }
-  else if (lastButtonState == LOW && currentButtonState == HIGH) {
+  else if (lastButtonState == LOW && currentButtonState == HIGH)
+  {
     // Button released
     unsigned long duration = millis() - buttonPressTime;
 
-    if (!isHolding && duration < 1000) {
+    if (!isHolding && duration < 1000)
+    {
       // Short Press Action
       displayPage = (displayPage + 1) % 2;
       updateOLED();
     }
-    else if (isHolding) {
+    else if (isHolding)
+    {
       // Released early during countdown -> Cancel operation
       updateOLED();
     }
@@ -820,11 +890,13 @@ void handleButtonPress(){
   lastButtonState = currentButtonState;
 }
 
-void loop(){
+void loop()
+{
   ArduinoOTA.handle();
 
   // Jika sedang OTA, hentikan semua proses lain (tombol, layar, waktu) agar tidak mengganggu transfer
-  if (ota_updating) {
+  if (ota_updating)
+  {
     delay(10);
     return;
   }
@@ -832,15 +904,18 @@ void loop(){
   handleButtonPress();
 
   unsigned long currentMillis = millis();
-  if (currentMillis - lastOledUpdate >= 1000) {
+  if (currentMillis - lastOledUpdate >= 1000)
+  {
     lastOledUpdate = currentMillis;
 
     struct tm timeinfo;
     // Parameter 10ms memastikan proses getLocalTime tidak nge-block loop berlama-lama jika gagal sync
     bool gotTime = getLocalTime(&timeinfo, 10);
 
-    if (gotTime) {
-      if (!ntpSynced) {
+    if (gotTime)
+    {
+      if (!ntpSynced)
+      {
         ntpSynced = true;
         int currentMin = getMinutesFromMidnight(timeinfo.tm_hour, timeinfo.tm_min);
         reconcileState(1, jobs1, currentMin);
@@ -848,13 +923,15 @@ void loop(){
         manualOverride1 = false;
         manualOverride2 = false;
       }
-      else {
+      else
+      {
         checkSchedules(timeinfo.tm_hour, timeinfo.tm_min);
       }
     }
 
     // Refresh layar secara periodik hanya jika sedang tidak menahan tombol
-    if (!isHolding) {
+    if (!isHolding)
+    {
       updateOLED();
     }
   }
