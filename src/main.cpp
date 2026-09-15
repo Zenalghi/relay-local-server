@@ -2,7 +2,7 @@
  * @file main.cpp
  * @brief R-Sync ESP32 Local Server Firmware
  * @author Zenalghi
- * 
+ *
  * GitHub Repositories:
  * - Firmware ESP32: https://github.com/Zenalghi/relay-local-server
  * - Flutter Client: https://github.com/Zenalghi/r_sync_app
@@ -58,21 +58,24 @@ bool oledConnected = false;
 volatile bool ota_updating = false;
 
 // Helper to draw centered Header with divider line
-void drawOledHeader(const char* title) {
-  if (!oledConnected) return;
+void drawOledHeader(const char *title){
+  if (!oledConnected)
+    return;
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   int len = strlen(title);
   int x = (128 - (len * 6)) / 2;
-  if (x < 0) x = 0;
+  if (x < 0)
+    x = 0;
   display.setCursor(x, 0);
   display.print(title);
   display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 }
 
 // Helper to draw centered "R-Sync" at the bottom row (y = 56 of 64px) on all screens
-void drawOledFooter() {
-  if (!oledConnected) return;
+void drawOledFooter(){
+  if (!oledConnected)
+    return;
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(46, 56);
@@ -82,32 +85,33 @@ void drawOledFooter() {
 AsyncWebServer server(80);
 Preferences preferences;
 
-void applyPolarity(bool isActiveLow) {
+void applyPolarity(bool isActiveLow){
   activeLow = isActiveLow;
   if (activeLow) {
     relayOnLevel = LOW;
     relayOffLevel = HIGH;
-  } else {
+  }
+  else {
     relayOnLevel = HIGH;
     relayOffLevel = LOW;
   }
 }
 
-void loadPolarity() {
+void loadPolarity(){
   preferences.begin("cfg", true);
   bool stored = preferences.getBool("activeLow", true);
   preferences.end();
   applyPolarity(stored);
 }
 
-void savePolarity() {
+void savePolarity(){
   preferences.begin("cfg", false);
   preferences.putBool("activeLow", activeLow);
   preferences.end();
 }
 
 // SVG Logo from R.svg
-const char* custom_svg_logo = R"rawliteral(
+const char *custom_svg_logo = R"rawliteral(
 <div style="text-align:center;">
 <svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="100px" height="100px" version="1.1" style="shape-rendering:geometricPrecision; text-rendering:geometricPrecision; image-rendering:optimizeQuality; fill-rule:evenodd; clip-rule:evenodd" viewBox="0 0 200.28 166.5" xmlns:xlink="http://www.w3.org/1999/xlink">
  <defs>
@@ -128,7 +132,7 @@ const char* custom_svg_logo = R"rawliteral(
 </div>
 )rawliteral";
 
-struct Job {
+struct Job{
   uint8_t hour;
   uint8_t minute;
   bool action;
@@ -145,23 +149,28 @@ bool ntpSynced = false;
 int lastEvaluatedMinute = -1;
 
 bool lastButtonState = HIGH;
+unsigned long buttonPressTime = 0;
+bool isHolding = false;
+
 int displayPage = 0;
 void updateOLED();
 
-void setRelay(int channel, bool state) {
+void setRelay(int channel, bool state){
   if (channel == 1) {
     digitalWrite(RELAY1_PIN, state ? relayOnLevel : relayOffLevel);
-  } else if (channel == 2) {
+  }
+  else if (channel == 2) {
     digitalWrite(RELAY2_PIN, state ? relayOnLevel : relayOffLevel);
   }
 }
 
-bool getRelay(int channel) {
-  if (channel == 1) return digitalRead(RELAY1_PIN) == relayOnLevel;
+bool getRelay(int channel){
+  if (channel == 1)
+    return digitalRead(RELAY1_PIN) == relayOnLevel;
   return digitalRead(RELAY2_PIN) == relayOnLevel;
 }
 
-void setRelayPolarityAndForceOff(bool isActiveLow) {
+void setRelayPolarityAndForceOff(bool isActiveLow){
   applyPolarity(isActiveLow);
   setRelay(1, false);
   setRelay(2, false);
@@ -170,14 +179,14 @@ void setRelayPolarityAndForceOff(bool isActiveLow) {
   savePolarity();
 }
 
-void loadJobs() {
+void loadJobs(){
   preferences.begin("sched", true);
   String json1 = preferences.getString("jobs1", "[]");
   String json2 = preferences.getString("jobs2", "[]");
   preferences.end();
-  
+
   JsonDocument doc;
-  
+
   DeserializationError error = deserializeJson(doc, json1);
   if (!error) {
     JsonArray arr = doc.as<JsonArray>();
@@ -202,7 +211,7 @@ void loadJobs() {
   }
 }
 
-void saveJobs() {
+void saveJobs(){
   JsonDocument doc;
   JsonArray arr1 = doc.to<JsonArray>();
   for (int i = 0; i < MAX_JOBS; i++) {
@@ -233,23 +242,24 @@ void saveJobs() {
   preferences.end();
 }
 
-int getMinutesFromMidnight(int h, int m) {
+int getMinutesFromMidnight(int h, int m){
   return h * 60 + m;
 }
 
-void reconcileState(int channel, Job* jobs, int currentMin) {
+void reconcileState(int channel, Job *jobs, int currentMin){
   int bestJobIndex = -1;
-  int minDiff = 24 * 60; 
+  int minDiff = 24 * 60;
 
   for (int i = 0; i < MAX_JOBS; i++) {
-    if (!jobs[i].enabled) continue;
+    if (!jobs[i].enabled)
+      continue;
     int jobMin = getMinutesFromMidnight(jobs[i].hour, jobs[i].minute);
-    
+
     int diff = currentMin - jobMin;
     if (diff < 0) {
       diff += 24 * 60;
     }
-    
+
     if (diff < minDiff) {
       minDiff = diff;
       bestJobIndex = i;
@@ -261,14 +271,15 @@ void reconcileState(int channel, Job* jobs, int currentMin) {
   }
 }
 
-void checkSchedules(int h, int m) {
+void checkSchedules(int h, int m){
   int currentMin = getMinutesFromMidnight(h, m);
-  if (currentMin == lastEvaluatedMinute) return; 
-  
+  if (currentMin == lastEvaluatedMinute)
+    return;
+
   for (int i = 0; i < MAX_JOBS; i++) {
     if (jobs1[i].enabled && getMinutesFromMidnight(jobs1[i].hour, jobs1[i].minute) == currentMin) {
       setRelay(1, jobs1[i].action);
-      manualOverride1 = false; 
+      manualOverride1 = false;
     }
   }
 
@@ -282,11 +293,11 @@ void checkSchedules(int h, int m) {
   lastEvaluatedMinute = currentMin;
 }
 
-const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 7 * 3600; 
-const int   daylightOffset_sec = 0;
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600;
+const int daylightOffset_sec = 0;
 
-void setupAPI() {
+void setupAPI(){
   // Enable CORS headers for Web clients (e.g. Flutter Web, Chrome, Edge)
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -298,10 +309,10 @@ void setupAPI() {
       request->send(200);
     } else {
       request->send(404, "text/plain", "Not Found");
-    }
-  });
+    } });
 
-  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
+ {
     JsonDocument doc;
     doc["ip"] = WiFi.localIP().toString();
     doc["wifi"] = WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
@@ -340,11 +351,10 @@ void setupAPI() {
 
     String response;
     serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
+    request->send(200, "application/json", response); });
 
-  server.on("/api/display", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+  server.on("/api/display", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+ {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, (const char*)data, len);
       if (!error && doc["page"].is<int>()) {
@@ -359,11 +369,10 @@ void setupAPI() {
         displayPage = (displayPage + 1) % 2;
       }
       updateOLED();
-      request->send(200, "application/json", "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}");
-  });
+      request->send(200, "application/json", "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}"); });
 
-  server.on("/api/relay", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+  server.on("/api/relay", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+ {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, (const char*)data, len);
       if (!error) {
@@ -378,11 +387,10 @@ void setupAPI() {
           return;
         }
       }
-      request->send(400, "application/json", "{\"status\":\"Error\"}");
-  });
+      request->send(400, "application/json", "{\"status\":\"Error\"}"); });
 
-  server.on("/api/relay/polarity", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+  server.on("/api/relay/polarity", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+ {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, (const char*)data, len);
       if (!error && doc["activeLow"].is<bool>()) {
@@ -399,11 +407,10 @@ void setupAPI() {
         request->send(200, "application/json", response);
         return;
       }
-      request->send(400, "application/json", "{\"status\":\"Error\"}");
-  });
+      request->send(400, "application/json", "{\"status\":\"Error\"}"); });
 
-  server.on("/api/schedule", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+  server.on("/api/schedule", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+ {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, (const char*)data, len);
       if (!error) {
@@ -432,20 +439,19 @@ void setupAPI() {
           return;
         }
       }
-      request->send(400, "application/json", "{\"status\":\"Error\"}");
-  });
+      request->send(400, "application/json", "{\"status\":\"Error\"}"); });
 
   // Endpoint to remotely trigger WiFi configuration portal
-  server.on("/api/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request){
+  server.on("/api/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+ {
     request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Resetting WiFi credentials. Opening Portal 'R-Sync'...\"}");
     delay(600);
     WiFiManager wm;
     wm.resetSettings();
-    ESP.restart();
-  });
+    ESP.restart(); });
 }
 
-void setup() {
+void setup(){
   Serial.begin(115200);
 
   pinMode(RELAY1_PIN, OUTPUT);
@@ -457,10 +463,11 @@ void setup() {
   digitalWrite(RELAY2_PIN, relayOffLevel);
 
   Wire.begin(21, 22);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed or not connected"));
     oledConnected = false;
-  } else {
+  }
+  else {
     oledConnected = true;
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -493,7 +500,7 @@ void setup() {
 
   WiFiManager wm;
   wm.setCustomHeadElement(custom_svg_logo);
-  
+
   // Stored WiFi connection timeout: 60s (ideal tolerance for router boot after blackout)
   wm.setConnectTimeout(60);
   // Portal timeout after 2 minutes of inactivity (auto-restarts to retry WiFi connection)
@@ -510,14 +517,12 @@ void setup() {
       display.println("IP: 192.168.4.1");
       drawOledFooter();
       display.display();
-    }
-  });
+    } });
 
   // Callback when user saves new WiFi credentials in web portal
   bool wifiConfigured = false;
-  wm.setSaveConfigCallback([&wifiConfigured]() {
-    wifiConfigured = true;
-  });
+  wm.setSaveConfigCallback([&wifiConfigured]()
+                { wifiConfigured = true; });
 
   if (oledConnected && !forcePortal) {
     display.clearDisplay();
@@ -534,7 +539,8 @@ void setup() {
   if (forcePortal) {
     wm.resetSettings();
     res = wm.startConfigPortal("R-Sync");
-  } else {
+  }
+  else {
     res = wm.autoConnect("R-Sync");
   }
 
@@ -560,7 +566,7 @@ void setup() {
 
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
-  
+
   if (oledConnected) {
     display.clearDisplay();
     drawOledHeader("- WIFI CONNECTED -");
@@ -575,7 +581,8 @@ void setup() {
 
   // OTA Setup
   ArduinoOTA.setHostname("r-sync");
-  ArduinoOTA.onStart([]() {
+  ArduinoOTA.onStart([]()
+          {
     ota_updating = true;
     if (oledConnected) {
       display.clearDisplay();
@@ -585,8 +592,7 @@ void setup() {
       display.println("Please wait...");
       drawOledFooter();
       display.display();
-    }
-  });
+    } });
   ArduinoOTA.onEnd([]() {
     ota_updating = false;
     if (oledConnected) {
@@ -597,8 +603,7 @@ void setup() {
       display.println("Rebooting...");
       drawOledFooter();
       display.display();
-    }
-  });
+    } });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     if (oledConnected) {
       int percentage = (progress / (total / 100));
@@ -610,9 +615,9 @@ void setup() {
       display.printf("Progress: %u%%", percentage);
       drawOledFooter();
       display.display();
-    }
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
+    } });
+  ArduinoOTA.onError([](ota_error_t error)
+          {
     ota_updating = false;
     if (oledConnected) {
       display.clearDisplay();
@@ -622,8 +627,7 @@ void setup() {
       display.println("Reverting changes...");
       drawOledFooter();
       display.display();
-    }
-  });
+    } });
   ArduinoOTA.begin();
 
   setupAPI();
@@ -632,11 +636,12 @@ void setup() {
 
 unsigned long lastOledUpdate = 0;
 
-void updateOLED() {
-  if (!oledConnected) return;
-  
+void updateOLED(){
+  if (!oledConnected)
+    return;
+
   display.clearDisplay();
-  
+
   if (displayPage == 0) {
     // Header
     drawOledHeader("- DEVICE STATUS -");
@@ -646,7 +651,8 @@ void updateOLED() {
     display.print("WiFi: ");
     if (WiFi.status() == WL_CONNECTED) {
       display.println(WiFi.localIP());
-    } else {
+    }
+    else {
       display.println("Disconnected");
     }
 
@@ -654,20 +660,24 @@ void updateOLED() {
     display.setCursor(0, 23);
     display.print("Time: ");
     struct tm timeinfo;
-    if(getLocalTime(&timeinfo, 10)){
+    if (getLocalTime(&timeinfo, 10)) {
       char timeStr[20];
       sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
       display.println(timeStr);
-    } else {
+    }
+    else {
       display.println("Syncing...");
     }
 
     // Relays
     display.setCursor(0, 35);
-    display.print("Relay 1: "); display.println(getRelay(1) ? "ON" : "OFF");
+    display.print("Relay 1: ");
+    display.println(getRelay(1) ? "ON" : "OFF");
     display.setCursor(0, 45);
-    display.print("Relay 2: "); display.println(getRelay(2) ? "ON" : "OFF");
-  } else {
+    display.print("Relay 2: ");
+    display.println(getRelay(2) ? "ON" : "OFF");
+  }
+  else {
     // Header
     drawOledHeader("- SCHEDULER LIST -");
 
@@ -679,7 +689,7 @@ void updateOLED() {
       int count = 0;
       for (int i = 0; i < MAX_JOBS; i++) {
         if (jobs[i].enabled) {
-          snprintf(items[count], sizeof(items[count]), "%02d:%02d%c", 
+          snprintf(items[count], sizeof(items[count]), "%02d:%02d%c",
                    jobs[i].hour, jobs[i].minute, jobs[i].action ? '+' : '-');
           count++;
         }
@@ -688,7 +698,8 @@ void updateOLED() {
       if (count == 0) {
         display.setCursor(24, startY);
         display.print("No Sched");
-      } else {
+      }
+      else {
         // Baris 1 (Jadwal 1 & 2)
         if (count >= 1) {
           display.setCursor(24, startY);
@@ -724,7 +735,92 @@ void updateOLED() {
   display.display();
 }
 
-void loop() {
+void drawOledCountdown(int secondsRemaining){
+  if (!oledConnected)
+    return;
+  display.clearDisplay();
+  drawOledHeader("- TOGGLE POLARITY -");
+
+  display.setTextSize(1);
+  display.setCursor(0, 14);
+  display.println("Keep holding button");
+  display.println("to switch polarity!");
+
+  display.setCursor(32, 36);
+  display.setTextSize(2);
+  display.printf("in %ds", secondsRemaining);
+
+  drawOledFooter();
+  display.display();
+}
+
+void handleButtonPress(){
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    // Button pressed down
+    buttonPressTime = millis();
+    isHolding = false;
+  }
+  else if (lastButtonState == LOW && currentButtonState == LOW) {
+    // Button is being held down
+    unsigned long duration = millis() - buttonPressTime;
+
+    if (duration >= 1000 && duration < 11000) {
+      isHolding = true;
+      int elapsedSeconds = (duration - 1000) / 1000;
+      int remaining = 10 - elapsedSeconds;
+      if (remaining < 0)
+        remaining = 0;
+
+      static int lastDisplayedSec = -1;
+      if (lastDisplayedSec != remaining) {
+        lastDisplayedSec = remaining;
+        drawOledCountdown(remaining);
+      }
+    }
+    else if (duration >= 11000) {
+      // Toggle Polarity Triggered
+      setRelayPolarityAndForceOff(!activeLow);
+
+      if (oledConnected) {
+        display.clearDisplay();
+        drawOledHeader("- TOGGLE POLARITY -");
+        display.setTextSize(1);
+        display.setCursor(0, 18);
+        display.println("Polarity Changed!");
+        display.printf("Mode: %s\n", activeLow ? "ACTIVE LOW" : "ACTIVE HIGH");
+        display.println("Relays reset to OFF");
+        drawOledFooter();
+        display.display();
+      }
+
+      delay(2000);
+      buttonPressTime = millis();
+      isHolding = false;
+      updateOLED();
+    }
+  }
+  else if (lastButtonState == LOW && currentButtonState == HIGH) {
+    // Button released
+    unsigned long duration = millis() - buttonPressTime;
+
+    if (!isHolding && duration < 1000) {
+      // Short Press Action
+      displayPage = (displayPage + 1) % 2;
+      updateOLED();
+    }
+    else if (isHolding) {
+      // Released early during countdown -> Cancel operation
+      updateOLED();
+    }
+    isHolding = false;
+  }
+
+  lastButtonState = currentButtonState;
+}
+
+void loop(){
   ArduinoOTA.handle();
 
   // Jika sedang OTA, hentikan semua proses lain (tombol, layar, waktu) agar tidak mengganggu transfer
@@ -733,22 +829,16 @@ void loop() {
     return;
   }
 
-  bool currentButtonState = digitalRead(BUTTON_PIN);
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
-    displayPage = (displayPage + 1) % 2;
-    updateOLED();
-    delay(50); // debounce
-  }
-  lastButtonState = currentButtonState;
+  handleButtonPress();
 
   unsigned long currentMillis = millis();
   if (currentMillis - lastOledUpdate >= 1000) {
     lastOledUpdate = currentMillis;
-    
+
     struct tm timeinfo;
     // Parameter 10ms memastikan proses getLocalTime tidak nge-block loop berlama-lama jika gagal sync
     bool gotTime = getLocalTime(&timeinfo, 10);
-    
+
     if (gotTime) {
       if (!ntpSynced) {
         ntpSynced = true;
@@ -757,11 +847,15 @@ void loop() {
         reconcileState(2, jobs2, currentMin);
         manualOverride1 = false;
         manualOverride2 = false;
-      } else {
+      }
+      else {
         checkSchedules(timeinfo.tm_hour, timeinfo.tm_min);
       }
     }
-    
-    updateOLED();
+
+    // Refresh layar secara periodik hanya jika sedang tidak menahan tombol
+    if (!isHolding) {
+      updateOLED();
+    }
   }
 }
