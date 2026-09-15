@@ -45,8 +45,10 @@
 #define RELAY2_PIN 25
 #define BUTTON_PIN 0
 
-#define RELAY_ON LOW
-#define RELAY_OFF HIGH
+// Default = active low (legacy module behavior)
+bool activeLow = true;
+uint8_t relayOnLevel = LOW;
+uint8_t relayOffLevel = HIGH;
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -79,6 +81,30 @@ void drawOledFooter() {
 
 AsyncWebServer server(80);
 Preferences preferences;
+
+void applyPolarity(bool isActiveLow) {
+  activeLow = isActiveLow;
+  if (activeLow) {
+    relayOnLevel = LOW;
+    relayOffLevel = HIGH;
+  } else {
+    relayOnLevel = HIGH;
+    relayOffLevel = LOW;
+  }
+}
+
+void loadPolarity() {
+  preferences.begin("cfg", true);
+  bool stored = preferences.getBool("activeLow", true);
+  preferences.end();
+  applyPolarity(stored);
+}
+
+void savePolarity() {
+  preferences.begin("cfg", false);
+  preferences.putBool("activeLow", activeLow);
+  preferences.end();
+}
 
 // SVG Logo from R.svg
 const char* custom_svg_logo = R"rawliteral(
@@ -124,15 +150,24 @@ void updateOLED();
 
 void setRelay(int channel, bool state) {
   if (channel == 1) {
-    digitalWrite(RELAY1_PIN, state ? RELAY_ON : RELAY_OFF);
+    digitalWrite(RELAY1_PIN, state ? relayOnLevel : relayOffLevel);
   } else if (channel == 2) {
-    digitalWrite(RELAY2_PIN, state ? RELAY_ON : RELAY_OFF);
+    digitalWrite(RELAY2_PIN, state ? relayOnLevel : relayOffLevel);
   }
 }
 
 bool getRelay(int channel) {
-  if (channel == 1) return digitalRead(RELAY1_PIN) == RELAY_ON;
-  return digitalRead(RELAY2_PIN) == RELAY_ON;
+  if (channel == 1) return digitalRead(RELAY1_PIN) == relayOnLevel;
+  return digitalRead(RELAY2_PIN) == relayOnLevel;
+}
+
+void setRelayPolarityAndForceOff(bool isActiveLow) {
+  applyPolarity(isActiveLow);
+  setRelay(1, false);
+  setRelay(2, false);
+  manualOverride1 = false;
+  manualOverride2 = false;
+  savePolarity();
 }
 
 void loadJobs() {
@@ -283,6 +318,7 @@ void setupAPI() {
     doc["relay1"] = getRelay(1) ? "ON" : "OFF";
     doc["relay2"] = getRelay(2) ? "ON" : "OFF";
     doc["displayPage"] = displayPage;
+    doc["activeLow"] = activeLow;
 
     JsonArray arr1 = doc["jobs1"].to<JsonArray>();
     for (int i = 0; i < MAX_JOBS; i++) {
@@ -345,6 +381,27 @@ void setupAPI() {
       request->send(400, "application/json", "{\"status\":\"Error\"}");
   });
 
+  server.on("/api/relay/polarity", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, (const char*)data, len);
+      if (!error && doc["activeLow"].is<bool>()) {
+        bool next = doc["activeLow"].as<bool>();
+        setRelayPolarityAndForceOff(next);
+
+        JsonDocument resp;
+        resp["status"] = "OK";
+        resp["activeLow"] = activeLow;
+        resp["relay1"] = "OFF";
+        resp["relay2"] = "OFF";
+        String response;
+        serializeJson(resp, response);
+        request->send(200, "application/json", response);
+        return;
+      }
+      request->send(400, "application/json", "{\"status\":\"Error\"}");
+  });
+
   server.on("/api/schedule", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
       JsonDocument doc;
@@ -394,8 +451,10 @@ void setup() {
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  digitalWrite(RELAY1_PIN, RELAY_OFF);
-  digitalWrite(RELAY2_PIN, RELAY_OFF);
+
+  loadPolarity();
+  digitalWrite(RELAY1_PIN, relayOffLevel);
+  digitalWrite(RELAY2_PIN, relayOffLevel);
 
   Wire.begin(21, 22);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
