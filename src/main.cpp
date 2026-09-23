@@ -264,24 +264,54 @@ void triggerSwitch(int switchIdx, bool turnOn) {
   switchStates[switchIdx] = turnOn ? 1 : 0;
 }
 
-void runServoSelfTest() {
-  Serial.println("[SERVO] Running self test sequence (3 cycles)...");
-  for (int cycle = 0; cycle < 3; cycle++) {
-    for (int s = 0; s < NUM_SERVOS; s++) {
-      servos[s].attach(SERVO_PINS[s], 500, 2400);
-      servos[s].write(pressAngle);
-    }
-    delay(350);
-    for (int s = 0; s < NUM_SERVOS; s++) {
-      servos[s].write(restAngle);
-    }
-    delay(350);
-    for (int s = 0; s < NUM_SERVOS; s++) {
-      servos[s].detach();
-    }
-    delay(200);
+void applyRestAngleImmediately() {
+  for (int s = 0; s < NUM_SERVOS; s++) {
+    servos[s].attach(SERVO_PINS[s], 500, 2400);
+    servos[s].write(restAngle);
   }
-  Serial.println("[SERVO] Self test sequence complete.");
+  delay(300);
+  for (int s = 0; s < NUM_SERVOS; s++) {
+    servos[s].detach();
+  }
+}
+
+void runServoSelfTest() {
+  Serial.println("[SERVO] Running SAFE self test sequence (3 cycles)...");
+  
+  // Calculate safe test angle in the OPPOSITE direction of pressAngle
+  // Example: if pressAngle=0 and restAngle=90, safe direction is towards 125-135 (away from switch)
+  uint8_t safeTestAngle;
+  if (pressAngle < restAngle) {
+    int target = (int)restAngle + 35;
+    safeTestAngle = (target > 170) ? 170 : (uint8_t)target;
+  } else {
+    int target = (int)restAngle - 35;
+    safeTestAngle = (target < 10) ? 10 : (uint8_t)target;
+  }
+
+  // Sweep servos in safe direction switch by switch (sequential to avoid jamming or switch presses)
+  for (int cycle = 0; cycle < 3; cycle++) {
+    for (int sw = 0; sw < NUM_SWITCHES; sw++) {
+      uint8_t onServo = sw * 2;
+      uint8_t offServo = sw * 2 + 1;
+
+      servos[onServo].attach(SERVO_PINS[onServo], 500, 2400);
+      servos[offServo].attach(SERVO_PINS[offServo], 500, 2400);
+
+      servos[onServo].write(safeTestAngle);
+      servos[offServo].write(safeTestAngle);
+      delay(250);
+
+      servos[onServo].write(restAngle);
+      servos[offServo].write(restAngle);
+      delay(250);
+
+      servos[onServo].detach();
+      servos[offServo].detach();
+      delay(100);
+    }
+  }
+  Serial.println("[SERVO] SAFE self test sequence complete.");
 }
 
 // ---------------------------------------------------------------- Scheduler Logic
@@ -718,6 +748,7 @@ void setupAPI() {
         if (doc["pressAngle"].is<uint8_t>()) pressAngle = doc["pressAngle"].as<uint8_t>();
         if (doc["pressDurationMs"].is<uint16_t>()) pressDurationMs = doc["pressDurationMs"].as<uint16_t>();
         saveServoConfig();
+        applyRestAngleImmediately();
         request->send(200, "application/json", "{\"status\":\"OK\"}");
         return;
       }
