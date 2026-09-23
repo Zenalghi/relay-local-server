@@ -148,6 +148,9 @@ bool getRelay(int channel);
 void triggerSwitch(int switchIdx, bool turnOn);
 void runServoSelfTest();
 
+// Self-test flag: set by API, executed in loop() to avoid WDT reset
+volatile bool servoTestRequested = false;
+
 // ---------------------------------------------------------------- Polarity Load/Save
 void applyPolarity(bool isActiveLow) {
   activeLow = isActiveLow;
@@ -275,11 +278,60 @@ void applyRestAngleImmediately() {
   }
 }
 
+// Non-blocking self-test state machine
+struct ServoTestState {
+  bool running = false;
+  int  cycle   = 0;
+  int  sw      = 0;      // current switch index (0..2)
+  int  phase   = 0;      // 0=move-to-safe, 1=return-to-rest
+  uint32_t phaseStartMs = 0;
+  uint8_t  safeAngle    = 90;
+};
+ServoTestState selfTest;
+
+// Called from loop() — drives the non-blocking test sequence
+void updateServoSelfTest() {
+  if (!selfTest.running) return;
+
+  uint32_t now = millis();
+  uint8_t onS  = selfTest.sw * 2;
+  uint8_t offS = selfTest.sw * 2 + 1;
+
+  if (selfTest.phase == 0) {
+    // Kick off movement to safe angle
+    servos[onS].attach(SERVO_PINS[onS], 500, 2400);
+    servos[offS].attach(SERVO_PINS[offS], 500, 2400);
+    servos[onS].write(selfTest.safeAngle);
+    servos[offS].write(selfTest.safeAngle);
+    selfTest.phase = 1;
+    selfTest.phaseStartMs = now;
+  } else if (selfTest.phase == 1 && now - selfTest.phaseStartMs >= 250) {
+    // Return to rest
+    servos[onS].write(restAngle);
+    servos[offS].write(restAngle);
+    selfTest.phase = 2;
+    selfTest.phaseStartMs = now;
+  } else if (selfTest.phase == 2 && now - selfTest.phaseStartMs >= 250) {
+    // Detach and advance
+    servos[onS].detach();
+    servos[offS].detach();
+    selfTest.sw++;
+    if (selfTest.sw >= NUM_SWITCHES) {
+      selfTest.sw = 0;
+      selfTest.cycle++;
+    }
+    if (selfTest.cycle >= 3) {
+      selfTest.running = false;
+      Serial.println("[SERVO] SAFE self test sequence complete.");
+    } else {
+      selfTest.phase = 0;
+    }
+  }
+}
+
 void runServoSelfTest() {
-  Serial.println("[SERVO] Running SAFE self test sequence (3 cycles)...");
-  
-  // Calculate safe test angle in the OPPOSITE direction of pressAngle
-  // Example: if pressAngle=0 and restAngle=90, safe direction is towards 125-135 (away from switch)
+  if (selfTest.running) return; // already running
+  Serial.println("[SERVO] Scheduling SAFE self test sequence (3 cycles)...");
   uint8_t safeTestAngle;
   if (pressAngle < restAngle) {
     int target = (int)restAngle + 35;
@@ -288,30 +340,12 @@ void runServoSelfTest() {
     int target = (int)restAngle - 35;
     safeTestAngle = (target < 10) ? 10 : (uint8_t)target;
   }
-
-  // Sweep servos in safe direction switch by switch (sequential to avoid jamming or switch presses)
-  for (int cycle = 0; cycle < 3; cycle++) {
-    for (int sw = 0; sw < NUM_SWITCHES; sw++) {
-      uint8_t onServo = sw * 2;
-      uint8_t offServo = sw * 2 + 1;
-
-      servos[onServo].attach(SERVO_PINS[onServo], 500, 2400);
-      servos[offServo].attach(SERVO_PINS[offServo], 500, 2400);
-
-      servos[onServo].write(safeTestAngle);
-      servos[offServo].write(safeTestAngle);
-      delay(250);
-
-      servos[onServo].write(restAngle);
-      servos[offServo].write(restAngle);
-      delay(250);
-
-      servos[onServo].detach();
-      servos[offServo].detach();
-      delay(100);
-    }
-  }
-  Serial.println("[SERVO] SAFE self test sequence complete.");
+  selfTest.safeAngle    = safeTestAngle;
+  selfTest.cycle        = 0;
+  selfTest.sw           = 0;
+  selfTest.phase        = 0;
+  selfTest.phaseStartMs = millis();
+  selfTest.running      = true;
 }
 
 // ---------------------------------------------------------------- Scheduler Logic
@@ -427,10 +461,23 @@ void drawOledHeader(const char *title) {
 
 void drawOledFooter() {
   if (!oledConnected) return;
+  display.drawFastHLine(0, 54, 128, SSD1306_WHITE);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(46, 56);
+
+  // Left: "R-Sync"
+  display.setCursor(0, 56);
   display.print("R-Sync");
+
+  // Right: time (if NTP synced) or nothing
+  struct tm timeinfo;
+  if (ntpSynced && getLocalTime(&timeinfo, 5)) {
+    char buf[9]; // "HH:MM:SS"
+    sprintf(buf, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    // 8 chars * 6px = 48px wide; start at 128-48 = 80
+    display.setCursor(80, 56);
+    display.print(buf);
+  }
 }
 
 void updateOLED() {
@@ -441,31 +488,28 @@ void updateOLED() {
     // PAGE 0: DEVICE STATUS
     drawOledHeader("- DEVICE STATUS -");
 
+    // Row 1 — IP address
     display.setCursor(0, 12);
-    display.print("IP: ");
+    display.print("WiFi: ");
     display.println(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Disconnected");
 
-    display.setCursor(0, 22);
-    display.print("Time: ");
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 10)) {
-      char timeStr[20];
-      sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-      display.println(timeStr);
-    } else {
-      display.println("Syncing...");
+    // Row 2 — Relays: R1 R2 R3 R4 compact (uses ~2 chars per relay)
+    // Layout: "R1 R2 R3 R4" with ON/OFF indicator dot or short label
+    // Each column ~32px wide — 4 columns across 128px
+    const char* rLabels[4] = {"R1", "R2", "R3", "R4"};
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      display.setCursor(i * 32, 24);
+      bool on = getRelay(i + 1);
+      display.printf("%s:%s", rLabels[i], on ? "ON" : "OF");
     }
 
-    display.setCursor(0, 34);
-    display.printf("R1:%s R2:%s R3:%s R4:%s\n",
-                   getRelay(1) ? "ON" : "OFF", getRelay(2) ? "ON" : "OFF",
-                   getRelay(3) ? "ON" : "OFF", getRelay(4) ? "ON" : "OFF");
-
-    display.setCursor(0, 44);
-    display.printf("SwA:%s SwB:%s SwC:%s\n",
-                   switchStates[0] == 1 ? "ON" : "OFF",
-                   switchStates[1] == 1 ? "ON" : "OFF",
-                   switchStates[2] == 1 ? "ON" : "OFF");
+    // Row 3 — Switches: SwA SwB SwC — 3 columns ~43px wide
+    const char* swLabels[3] = {"A", "B", "C"};
+    for (int i = 0; i < NUM_SWITCHES; i++) {
+      display.setCursor(i * 43, 36);
+      bool on = (switchStates[i] == 1);
+      display.printf("Sw%s:%s", swLabels[i], on ? "ON" : "OF");
+    }
   }
   else if (displayPage == 1) {
     // PAGE 1: RELAY SCHEDULES
@@ -934,8 +978,8 @@ void setup() {
 
   loadJobs();
 
-  // Servo Self Test at Boot
-  runServoSelfTest();
+  // NOTE: Self-test is NOT run at boot automatically.
+  // Trigger it via POST /api/servo/test from the Flutter app.
 
   // Instant WiFi Reset if BOOT button held down during startup
   bool forcePortal = false;
@@ -1081,6 +1125,7 @@ void loop() {
 
   handleButtonPress();
   updateServos();
+  updateServoSelfTest(); // non-blocking self-test state machine
 
   unsigned long currentMillis = millis();
 
