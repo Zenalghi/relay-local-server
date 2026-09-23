@@ -120,7 +120,7 @@ Firmware ini menggunakan otentikasi password pada skema upload OTA (*Over-The-Ai
 1. Buat / edit file `secrets.ini` di direktori utama projek:
 ```ini
 [secrets]
-ota_password = servo6-ota
+ota_password = change-me
 ```
 2. File `secrets.ini` tercantum pada `.gitignore` sehingga password rahasia kamu tidak akan terunggah ke repositori publik.
 
