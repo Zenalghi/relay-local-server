@@ -960,20 +960,30 @@ void setup() {
     setRelay(r, false);
   }
 
-  // OLED Init
+ // OLED Init - Safe Detection
   Wire.begin(OLED_SDA, OLED_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 OLED allocation failed"));
-    oledConnected = false;
+  
+  // Cek keberadaan hardware I2C terlebih dahulu (I2C Ping)
+  Wire.beginTransmission(0x3C);
+  if (Wire.endTransmission() == 0) {
+    // Alamat 0x3C merespon, baru inisialisasi display
+    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+      oledConnected = true;
+      display.clearDisplay();
+      drawOledHeader("- SYSTEM START -");
+      display.setCursor(0, 20);
+      display.println("Booting R-Sync...");
+      display.println("Please wait...");
+      drawOledFooter();
+      display.display();
+    } else {
+      oledConnected = false;
+      Serial.println(F("[I2C] SSD1306 allocation failed"));
+    }
   } else {
-    oledConnected = true;
-    display.clearDisplay();
-    drawOledHeader("- SYSTEM START -");
-    display.setCursor(0, 20);
-    display.println("Booting R-Sync...");
-    display.println("Please wait...");
-    drawOledFooter();
-    display.display();
+    // OLED Tidak Terpasang
+    oledConnected = false;
+    Serial.println(F("[I2C] OLED SSD1306 not detected on 0x3C. Skipping display operations."));
   }
 
   loadJobs();
