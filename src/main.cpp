@@ -2,10 +2,18 @@
  * @file main.cpp
  * @brief R-Sync ESP32 Local Server Firmware (Combined 4 Relays + 6 Servos + Timers + Scheduler)
  * @author Zenalghi
+ * @version 3.0.0
  *
  * Repositories:
  * - Firmware ESP32: https://github.com/Zenalghi/relay-local-server
  * - Flutter Client: https://github.com/Zenalghi/r_sync_app
+ *
+ * Changelog v3.0.0:
+ * - Timer persistence: saved/loaded from Preferences (survives reboot)
+ * - Scheduler redesigned: global list (max 10), multi-channel per entry
+ * - Hardware pin config: relay/switch can be disabled via API + Preferences
+ * - Capabilities API: oled_connected, active_relays[], active_switches[]
+ * - MAX_JOBS per channel increased to 10 (scheduler global)
  */
 
 #include <Arduino.h>
@@ -22,14 +30,14 @@
 #undef HTTP_HEAD
 #undef HTTP_OPTIONS
 #undef HTTP_ANY
-#define HTTP_GET     0b00000001
-#define HTTP_POST    0b00000010
-#define HTTP_DELETE  0b00000100
-#define HTTP_PUT     0b00001000
-#define HTTP_PATCH   0b00010000
-#define HTTP_HEAD    0b00200000
+#define HTTP_GET 0b00000001
+#define HTTP_POST 0b00000010
+#define HTTP_DELETE 0b00000100
+#define HTTP_PUT 0b00001000
+#define HTTP_PATCH 0b00010000
+#define HTTP_HEAD 0b00200000
 #define HTTP_OPTIONS 0b01000000
-#define HTTP_ANY     0b01111111
+#define HTTP_ANY 0b01111111
 
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -61,6 +69,11 @@ const uint8_t SERVO_PINS[NUM_SERVOS] = {14, 27, 26, 25, 33, 32};
 #define OLED_SDA 21
 #define OLED_SCL 22
 
+// ---------------------------------------------------------------- Hardware Active Flags (runtime configurable)
+// These can be toggled via API and are stored in Preferences
+bool relayActive[NUM_RELAYS] = {true, true, true, true};
+bool switchActive[NUM_SWITCHES] = {true, true, true};
+
 // ---------------------------------------------------------------- Relay Polarity
 bool activeLow = true;
 uint8_t relayOnLevel = LOW;
@@ -73,7 +86,7 @@ uint8_t relayOffLevel = HIGH;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledConnected = false;
 volatile bool ota_updating = false;
-int displayPage = 0; // 0: Status, 1: Relay Sched, 2: Switch Sched, 3: Timers
+int displayPage = 0; // 0: Status, 1: Sched, 2: Timers
 
 // ---------------------------------------------------------------- Servos & Calibration
 Servo servos[NUM_SERVOS];
@@ -85,7 +98,8 @@ uint16_t pressDurationMs = 400;
 int switchStates[NUM_SWITCHES] = {0, 0, 0};
 
 // Non-blocking servo pulse structure
-struct ServoAction {
+struct ServoAction
+{
   uint8_t servoIdx;
   uint8_t targetAngle;
   uint32_t startTimeMs;
@@ -97,36 +111,38 @@ struct ServoAction {
 #define MAX_SERVO_ACTIONS 6
 ServoAction servoActions[MAX_SERVO_ACTIONS];
 
-// ---------------------------------------------------------------- Scheduler
-struct Job {
+// ---------------------------------------------------------------- Scheduler (Global, Multi-Channel)
+// Each schedule entry can target multiple relays AND switches simultaneously
+#define MAX_SCHEDULES 10
+
+struct ScheduleEntry
+{
   uint8_t hour;
   uint8_t minute;
   bool action; // true = ON, false = OFF
   bool enabled;
+  bool targetRelays[NUM_RELAYS];
+  bool targetSwitches[NUM_SWITCHES];
 };
 
-#define MAX_JOBS 4
-// 4 Relays + 3 Switches = 7 channels
-// Index 0..3 -> Relay 1..4
-// Index 4..6 -> Switch A..C (Index 4: Switch A, 5: Switch B, 6: Switch C)
-Job channelJobs[7][MAX_JOBS];
-
+ScheduleEntry schedules[MAX_SCHEDULES];
 int lastEvaluatedMinute = -1;
 bool ntpSynced = false;
 
 // ---------------------------------------------------------------- Timer Engine
 #define MAX_TIMERS 10
 
-struct TimerItem {
+struct TimerItem
+{
   int id;
   uint32_t totalDurationSec;
   uint32_t remainingSec;
   bool paused;
   bool active;
-  bool invertOnStartEnd; // If true: set opposite state on start, target state on finish
-  bool targetAction;     // true = ON, false = OFF
-  bool targetRelays[NUM_RELAYS];   // true if this relay is selected
-  bool targetSwitches[NUM_SWITCHES]; // true if this switch is selected
+  bool invertOnStartEnd;
+  bool targetAction;
+  bool targetRelays[NUM_RELAYS];
+  bool targetSwitches[NUM_SWITCHES];
 };
 
 TimerItem timers[MAX_TIMERS];
@@ -148,22 +164,27 @@ bool getRelay(int channel);
 void triggerSwitch(int switchIdx, bool turnOn);
 void runServoSelfTest();
 
-// Self-test flag: set by API, executed in loop() to avoid WDT reset
+// Self-test flag
 volatile bool servoTestRequested = false;
 
 // ---------------------------------------------------------------- Polarity Load/Save
-void applyPolarity(bool isActiveLow) {
+void applyPolarity(bool isActiveLow)
+{
   activeLow = isActiveLow;
-  if (activeLow) {
+  if (activeLow)
+  {
     relayOnLevel = LOW;
     relayOffLevel = HIGH;
-  } else {
+  }
+  else
+  {
     relayOnLevel = HIGH;
     relayOffLevel = LOW;
   }
 }
 
-void loadPolarity() {
+void loadPolarity()
+{
   preferences.begin("cfg", true);
   bool stored = preferences.getBool("activeLow", true);
   restAngle = preferences.getUChar("restAngle", 90);
@@ -173,17 +194,52 @@ void loadPolarity() {
   applyPolarity(stored);
 }
 
-void savePolarity() {
+void savePolarity()
+{
   preferences.begin("cfg", false);
   preferences.putBool("activeLow", activeLow);
   preferences.end();
 }
 
-void saveServoConfig() {
+void saveServoConfig()
+{
   preferences.begin("cfg", false);
   preferences.putUChar("restAngle", restAngle);
   preferences.putUChar("pressAngle", pressAngle);
   preferences.putUShort("pressDur", pressDurationMs);
+  preferences.end();
+}
+
+// ---------------------------------------------------------------- Hardware Active Config Load/Save
+void loadHardwareConfig()
+{
+  preferences.begin("hwcfg", true);
+  for (int i = 0; i < NUM_RELAYS; i++)
+  {
+    String key = "r" + String(i);
+    relayActive[i] = preferences.getBool(key.c_str(), true);
+  }
+  for (int i = 0; i < NUM_SWITCHES; i++)
+  {
+    String key = "s" + String(i);
+    switchActive[i] = preferences.getBool(key.c_str(), true);
+  }
+  preferences.end();
+}
+
+void saveHardwareConfig()
+{
+  preferences.begin("hwcfg", false);
+  for (int i = 0; i < NUM_RELAYS; i++)
+  {
+    String key = "r" + String(i);
+    preferences.putBool(key.c_str(), relayActive[i]);
+  }
+  for (int i = 0; i < NUM_SWITCHES; i++)
+  {
+    String key = "s" + String(i);
+    preferences.putBool(key.c_str(), switchActive[i]);
+  }
   preferences.end();
 }
 
@@ -201,31 +257,43 @@ const char *custom_svg_logo = R"rawliteral(
 )rawliteral";
 
 // ---------------------------------------------------------------- Relays & Servos Control
-void setRelay(int channel, bool state) {
-  if (channel < 1 || channel > NUM_RELAYS) return;
+void setRelay(int channel, bool state)
+{
+  if (channel < 1 || channel > NUM_RELAYS)
+    return;
+  if (!relayActive[channel - 1])
+    return; // Skip disabled relay
   digitalWrite(RELAY_PINS[channel - 1], state ? relayOnLevel : relayOffLevel);
 }
 
-bool getRelay(int channel) {
-  if (channel < 1 || channel > NUM_RELAYS) return false;
+bool getRelay(int channel)
+{
+  if (channel < 1 || channel > NUM_RELAYS)
+    return false;
   return digitalRead(RELAY_PINS[channel - 1]) == relayOnLevel;
 }
 
-void setRelayPolarityAndForceOff(bool isActiveLow) {
+void setRelayPolarityAndForceOff(bool isActiveLow)
+{
   applyPolarity(isActiveLow);
-  for (int i = 1; i <= NUM_RELAYS; i++) {
-    setRelay(i, false);
+  for (int i = 1; i <= NUM_RELAYS; i++)
+  {
+    digitalWrite(RELAY_PINS[i - 1], relayOffLevel); // Force via hardware
   }
   savePolarity();
 }
 
-void startServoMovement(uint8_t servoIdx, uint8_t targetAngle, uint16_t durationMs) {
-  if (servoIdx >= NUM_SERVOS) return;
+void startServoMovement(uint8_t servoIdx, uint8_t targetAngle, uint16_t durationMs)
+{
+  if (servoIdx >= NUM_SERVOS)
+    return;
   servos[servoIdx].attach(SERVO_PINS[servoIdx], 500, 2400);
   servos[servoIdx].write(targetAngle);
 
-  for (int i = 0; i < MAX_SERVO_ACTIONS; i++) {
-    if (!servoActions[i].active || servoActions[i].servoIdx == servoIdx) {
+  for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
+  {
+    if (!servoActions[i].active || servoActions[i].servoIdx == servoIdx)
+    {
       servoActions[i].servoIdx = servoIdx;
       servoActions[i].targetAngle = targetAngle;
       servoActions[i].startTimeMs = millis();
@@ -237,20 +305,25 @@ void startServoMovement(uint8_t servoIdx, uint8_t targetAngle, uint16_t duration
   }
 }
 
-void updateServos() {
+void updateServos()
+{
   uint32_t now = millis();
-  for (int i = 0; i < MAX_SERVO_ACTIONS; i++) {
-    if (servoActions[i].active) {
-      if (now - servoActions[i].startTimeMs >= servoActions[i].durationMs) {
+  for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
+  {
+    if (servoActions[i].active)
+    {
+      if (now - servoActions[i].startTimeMs >= servoActions[i].durationMs)
+      {
         uint8_t idx = servoActions[i].servoIdx;
-        if (!servoActions[i].returningToRest) {
-          // Move back to rest angle
+        if (!servoActions[i].returningToRest)
+        {
           servos[idx].write(restAngle);
           servoActions[i].startTimeMs = now;
           servoActions[i].durationMs = pressDurationMs;
           servoActions[i].returningToRest = true;
-        } else {
-          // Finished returning to rest -> Detach
+        }
+        else
+        {
           servos[idx].detach();
           servoActions[i].active = false;
         }
@@ -259,307 +332,427 @@ void updateServos() {
   }
 }
 
-void triggerSwitch(int switchIdx, bool turnOn) {
-  if (switchIdx < 0 || switchIdx >= NUM_SWITCHES) return;
-  // Servo index for Switch A: ON=0, OFF=1. Switch B: ON=2, OFF=3. Switch C: ON=4, OFF=5.
+void triggerSwitch(int switchIdx, bool turnOn)
+{
+  if (switchIdx < 0 || switchIdx >= NUM_SWITCHES)
+    return;
+  if (!switchActive[switchIdx])
+    return; // Skip disabled switch
   uint8_t servoIdx = (switchIdx * 2) + (turnOn ? 0 : 1);
   startServoMovement(servoIdx, pressAngle, pressDurationMs);
   switchStates[switchIdx] = turnOn ? 1 : 0;
 }
 
-void applyRestAngleImmediately() {
-  for (int s = 0; s < NUM_SERVOS; s++) {
+void applyRestAngleImmediately()
+{
+  for (int s = 0; s < NUM_SERVOS; s++)
+  {
     servos[s].attach(SERVO_PINS[s], 500, 2400);
     servos[s].write(restAngle);
   }
   delay(300);
-  for (int s = 0; s < NUM_SERVOS; s++) {
+  for (int s = 0; s < NUM_SERVOS; s++)
+  {
     servos[s].detach();
   }
 }
 
 // Non-blocking self-test state machine
-struct ServoTestState {
+struct ServoTestState
+{
   bool running = false;
-  int  cycle   = 0;
-  int  sw      = 0;      // current switch index (0..2)
-  int  phase   = 0;      // 0=move-to-safe, 1=return-to-rest
+  int cycle = 0;
+  int sw = 0;
+  int phase = 0;
   uint32_t phaseStartMs = 0;
-  uint8_t  safeAngle    = 90;
+  uint8_t safeAngle = 90;
 };
 ServoTestState selfTest;
 
-// Called from loop() — drives the non-blocking test sequence
-void updateServoSelfTest() {
-  if (!selfTest.running) return;
+void updateServoSelfTest()
+{
+  if (!selfTest.running)
+    return;
 
   uint32_t now = millis();
-  uint8_t onS  = selfTest.sw * 2;
+  uint8_t onS = selfTest.sw * 2;
   uint8_t offS = selfTest.sw * 2 + 1;
 
-  if (selfTest.phase == 0) {
-    // Kick off movement to safe angle
+  if (selfTest.phase == 0)
+  {
     servos[onS].attach(SERVO_PINS[onS], 500, 2400);
     servos[offS].attach(SERVO_PINS[offS], 500, 2400);
     servos[onS].write(selfTest.safeAngle);
     servos[offS].write(selfTest.safeAngle);
     selfTest.phase = 1;
     selfTest.phaseStartMs = now;
-  } else if (selfTest.phase == 1 && now - selfTest.phaseStartMs >= 250) {
-    // Return to rest
+  }
+  else if (selfTest.phase == 1 && now - selfTest.phaseStartMs >= 250)
+  {
     servos[onS].write(restAngle);
     servos[offS].write(restAngle);
     selfTest.phase = 2;
     selfTest.phaseStartMs = now;
-  } else if (selfTest.phase == 2 && now - selfTest.phaseStartMs >= 250) {
-    // Detach and advance
+  }
+  else if (selfTest.phase == 2 && now - selfTest.phaseStartMs >= 250)
+  {
     servos[onS].detach();
     servos[offS].detach();
     selfTest.sw++;
-    if (selfTest.sw >= NUM_SWITCHES) {
+    if (selfTest.sw >= NUM_SWITCHES)
+    {
       selfTest.sw = 0;
       selfTest.cycle++;
     }
-    if (selfTest.cycle >= 3) {
+    if (selfTest.cycle >= 3)
+    {
       selfTest.running = false;
       Serial.println("[SERVO] SAFE self test sequence complete.");
-    } else {
+    }
+    else
+    {
       selfTest.phase = 0;
     }
   }
 }
 
-void runServoSelfTest() {
-  if (selfTest.running) return; // already running
+void runServoSelfTest()
+{
+  if (selfTest.running)
+    return;
   Serial.println("[SERVO] Scheduling SAFE self test sequence (3 cycles)...");
   uint8_t safeTestAngle;
-  if (pressAngle < restAngle) {
+  if (pressAngle < restAngle)
+  {
     int target = (int)restAngle + 35;
     safeTestAngle = (target > 170) ? 170 : (uint8_t)target;
-  } else {
+  }
+  else
+  {
     int target = (int)restAngle - 35;
     safeTestAngle = (target < 10) ? 10 : (uint8_t)target;
   }
-  selfTest.safeAngle    = safeTestAngle;
-  selfTest.cycle        = 0;
-  selfTest.sw           = 0;
-  selfTest.phase        = 0;
+  selfTest.safeAngle = safeTestAngle;
+  selfTest.cycle = 0;
+  selfTest.sw = 0;
+  selfTest.phase = 0;
   selfTest.phaseStartMs = millis();
-  selfTest.running      = true;
+  selfTest.running = true;
 }
 
-// ---------------------------------------------------------------- Scheduler Logic
-void loadJobs() {
-  preferences.begin("sched", true);
-  for (int ch = 0; ch < 7; ch++) {
-    String key = "ch" + String(ch);
-    String json = preferences.getString(key.c_str(), "[]");
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, json);
-    if (!error) {
-      JsonArray arr = doc.as<JsonArray>();
-      for (int i = 0; i < MAX_JOBS && i < arr.size(); i++) {
-        channelJobs[ch][i].hour = arr[i]["h"] | 0;
-        channelJobs[ch][i].minute = arr[i]["m"] | 0;
-        channelJobs[ch][i].action = arr[i]["a"] | false;
-        channelJobs[ch][i].enabled = arr[i]["e"] | false;
-      }
+// ---------------------------------------------------------------- Scheduler Load/Save (Global Multi-Channel)
+void loadSchedules()
+{
+  preferences.begin("sched2", true);
+  String json = preferences.getString("entries", "[]");
+  preferences.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err)
+    return;
+
+  JsonArray arr = doc.as<JsonArray>();
+  for (int i = 0; i < MAX_SCHEDULES && i < (int)arr.size(); i++)
+  {
+    JsonObject obj = arr[i].as<JsonObject>();
+    schedules[i].hour = obj["h"] | 0;
+    schedules[i].minute = obj["m"] | 0;
+    schedules[i].action = obj["a"] | false;
+    schedules[i].enabled = obj["e"] | false;
+
+    JsonArray rArr = obj["r"].as<JsonArray>();
+    for (int r = 0; r < NUM_RELAYS; r++)
+    {
+      schedules[i].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
+    }
+    JsonArray sArr = obj["s"].as<JsonArray>();
+    for (int s = 0; s < NUM_SWITCHES; s++)
+    {
+      schedules[i].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
     }
   }
-  preferences.end();
+  Serial.println("[SCHED] Schedules loaded from Preferences.");
 }
 
-void saveJobs() {
-  preferences.begin("sched", false);
-  for (int ch = 0; ch < 7; ch++) {
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < MAX_JOBS; i++) {
-      JsonObject obj = arr.add<JsonObject>();
-      obj["h"] = channelJobs[ch][i].hour;
-      obj["m"] = channelJobs[ch][i].minute;
-      obj["a"] = channelJobs[ch][i].action;
-      obj["e"] = channelJobs[ch][i].enabled;
-    }
-    String json;
-    serializeJson(doc, json);
-    String key = "ch" + String(ch);
-    preferences.putString(key.c_str(), json);
+void saveSchedules()
+{
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < MAX_SCHEDULES; i++)
+  {
+    JsonObject obj = arr.add<JsonObject>();
+    obj["h"] = schedules[i].hour;
+    obj["m"] = schedules[i].minute;
+    obj["a"] = schedules[i].action;
+    obj["e"] = schedules[i].enabled;
+    JsonArray rArr = obj["r"].to<JsonArray>();
+    for (int r = 0; r < NUM_RELAYS; r++)
+      rArr.add(schedules[i].targetRelays[r]);
+    JsonArray sArr = obj["s"].to<JsonArray>();
+    for (int s = 0; s < NUM_SWITCHES; s++)
+      sArr.add(schedules[i].targetSwitches[s]);
   }
+  String json;
+  serializeJson(doc, json);
+  preferences.begin("sched2", false);
+  preferences.putString("entries", json);
   preferences.end();
+  Serial.println("[SCHED] Schedules saved to Preferences.");
 }
 
-int getMinutesFromMidnight(int h, int m) {
-  return h * 60 + m;
-}
+int getMinutesFromMidnight(int h, int m) { return h * 60 + m; }
 
-void applyChannelAction(int ch, bool action) {
-  if (ch >= 0 && ch < 4) {
-    // Relays 1..4
-    setRelay(ch + 1, action);
-  } else if (ch >= 4 && ch < 7) {
-    // Switches A..C
-    triggerSwitch(ch - 4, action);
+void applyChannelAction(bool targetRelays[], bool targetSwitches[], bool action)
+{
+  for (int r = 0; r < NUM_RELAYS; r++)
+  {
+    if (targetRelays[r])
+      setRelay(r + 1, action);
+  }
+  for (int s = 0; s < NUM_SWITCHES; s++)
+  {
+    if (targetSwitches[s])
+      triggerSwitch(s, action);
   }
 }
 
-void checkSchedules(int h, int m) {
+void checkSchedules(int h, int m)
+{
   int currentMin = getMinutesFromMidnight(h, m);
-  if (currentMin == lastEvaluatedMinute) return;
+  if (currentMin == lastEvaluatedMinute)
+    return;
 
-  for (int ch = 0; ch < 7; ch++) {
-    for (int i = 0; i < MAX_JOBS; i++) {
-      if (channelJobs[ch][i].enabled && getMinutesFromMidnight(channelJobs[ch][i].hour, channelJobs[ch][i].minute) == currentMin) {
-        applyChannelAction(ch, channelJobs[ch][i].action);
-      }
+  for (int i = 0; i < MAX_SCHEDULES; i++)
+  {
+    if (schedules[i].enabled &&
+        getMinutesFromMidnight(schedules[i].hour, schedules[i].minute) == currentMin)
+    {
+      applyChannelAction(schedules[i].targetRelays, schedules[i].targetSwitches, schedules[i].action);
     }
   }
   lastEvaluatedMinute = currentMin;
 }
 
 // ---------------------------------------------------------------- Timer Engine Logic
-void applyTimerTargets(TimerItem &t, bool action) {
-  for (int r = 0; r < NUM_RELAYS; r++) {
-    if (t.targetRelays[r]) {
+void applyTimerTargets(TimerItem &t, bool action)
+{
+  for (int r = 0; r < NUM_RELAYS; r++)
+  {
+    if (t.targetRelays[r])
       setRelay(r + 1, action);
-    }
   }
-  for (int s = 0; s < NUM_SWITCHES; s++) {
-    if (t.targetSwitches[s]) {
+  for (int s = 0; s < NUM_SWITCHES; s++)
+  {
+    if (t.targetSwitches[s])
       triggerSwitch(s, action);
-    }
   }
 }
 
-void tickTimers() {
-  for (int i = 0; i < MAX_TIMERS; i++) {
-    if (timers[i].active && !timers[i].paused) {
-      if (timers[i].remainingSec > 0) {
+void saveTimers()
+{
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < MAX_TIMERS; i++)
+  {
+    if (timers[i].active)
+    {
+      JsonObject obj = arr.add<JsonObject>();
+      obj["id"] = timers[i].id;
+      obj["total"] = timers[i].totalDurationSec;
+      obj["rem"] = timers[i].remainingSec;
+      obj["pause"] = timers[i].paused;
+      obj["inv"] = timers[i].invertOnStartEnd;
+      obj["act"] = timers[i].targetAction;
+      JsonArray rArr = obj["r"].to<JsonArray>();
+      for (int r = 0; r < NUM_RELAYS; r++)
+        rArr.add(timers[i].targetRelays[r]);
+      JsonArray sArr = obj["s"].to<JsonArray>();
+      for (int s = 0; s < NUM_SWITCHES; s++)
+        sArr.add(timers[i].targetSwitches[s]);
+    }
+  }
+  String json;
+  serializeJson(doc, json);
+  preferences.begin("timers", false);
+  preferences.putString("active", json);
+  preferences.putInt("nextId", nextTimerId);
+  preferences.end();
+}
+
+void loadTimers()
+{
+  preferences.begin("timers", true);
+  String json = preferences.getString("active", "[]");
+  nextTimerId = preferences.getInt("nextId", 1);
+  preferences.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err)
+    return;
+
+  JsonArray arr = doc.as<JsonArray>();
+  int slot = 0;
+  for (JsonObject obj : arr)
+  {
+    if (slot >= MAX_TIMERS)
+      break;
+    timers[slot].id = obj["id"] | slot + 1;
+    timers[slot].totalDurationSec = obj["total"] | 0;
+    timers[slot].remainingSec = obj["rem"] | 0;
+    timers[slot].paused = obj["pause"] | false;
+    timers[slot].invertOnStartEnd = obj["inv"] | false;
+    timers[slot].targetAction = obj["act"] | false;
+    timers[slot].active = (timers[slot].remainingSec > 0);
+
+    JsonArray rArr = obj["r"].as<JsonArray>();
+    for (int r = 0; r < NUM_RELAYS; r++)
+    {
+      timers[slot].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
+    }
+    JsonArray sArr = obj["s"].as<JsonArray>();
+    for (int s = 0; s < NUM_SWITCHES; s++)
+    {
+      timers[slot].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
+    }
+    slot++;
+  }
+  Serial.printf("[TIMERS] Loaded %d active timers from Preferences.\n", slot);
+}
+
+void tickTimers()
+{
+  bool changed = false;
+  for (int i = 0; i < MAX_TIMERS; i++)
+  {
+    if (timers[i].active && !timers[i].paused)
+    {
+      if (timers[i].remainingSec > 0)
+      {
         timers[i].remainingSec--;
-        if (timers[i].remainingSec == 0) {
-          // Timer finished! Execute target action
+        if (timers[i].remainingSec == 0)
+        {
           applyTimerTargets(timers[i], timers[i].targetAction);
           timers[i].active = false;
+          changed = true;
         }
       }
     }
   }
+  if (changed)
+    saveTimers();
 }
 
 // ---------------------------------------------------------------- OLED Display Manager
-void drawOledHeader(const char *title) {
-  if (!oledConnected) return;
+void drawOledHeader(const char *title)
+{
+  if (!oledConnected)
+    return;
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   int len = strlen(title);
   int x = (128 - (len * 6)) / 2;
-  if (x < 0) x = 0;
+  if (x < 0)
+    x = 0;
   display.setCursor(x, 0);
   display.print(title);
   display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 }
 
-void drawOledFooter() {
-  if (!oledConnected) return;
+void drawOledFooter()
+{
+  if (!oledConnected)
+    return;
   display.drawFastHLine(0, 54, 128, SSD1306_WHITE);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
-  // Left: "R-Sync"
   display.setCursor(0, 56);
   display.print("R-Sync");
 
-  // Right: time (if NTP synced) or nothing
   struct tm timeinfo;
-  if (ntpSynced && getLocalTime(&timeinfo, 5)) {
-    char buf[9]; // "HH:MM:SS"
+  if (ntpSynced && getLocalTime(&timeinfo, 0))
+  {
+    char buf[9];
     sprintf(buf, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-    // 8 chars * 6px = 48px wide; start at 128-48 = 80
     display.setCursor(80, 56);
     display.print(buf);
   }
 }
 
-void updateOLED() {
-  if (!oledConnected) return;
+void updateOLED()
+{
+  if (!oledConnected)
+    return;
   display.clearDisplay();
 
-  if (displayPage == 0) {
+  // Count active pages: 0 always shown, 1 if schedules exist, 2 if timers exist
+  int totalPages = 3;
+
+  if (displayPage == 0)
+  {
     // PAGE 0: DEVICE STATUS
     drawOledHeader("- DEVICE STATUS -");
-
-    // Row 1 — IP address
     display.setCursor(0, 12);
     display.print("WiFi: ");
     display.println(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Disconnected");
 
-    // Row 2 — Relays: R1 R2 R3 R4 compact (uses ~2 chars per relay)
-    // Layout: "R1 R2 R3 R4" with ON/OFF indicator dot or short label
-    // Each column ~32px wide — 4 columns across 128px
-    const char* rLabels[4] = {"R1", "R2", "R3", "R4"};
-    for (int i = 0; i < NUM_RELAYS; i++) {
+    const char *rLabels[4] = {"R1", "R2", "R3", "R4"};
+    for (int i = 0; i < NUM_RELAYS; i++)
+    {
+      if (!relayActive[i])
+        continue;
       display.setCursor(i * 32, 24);
       bool on = getRelay(i + 1);
       display.printf("%s:%s", rLabels[i], on ? "ON" : "OF");
     }
 
-    // Row 3 — Switches: SwA SwB SwC — 3 columns ~43px wide
-    const char* swLabels[3] = {"A", "B", "C"};
-    for (int i = 0; i < NUM_SWITCHES; i++) {
+    const char *swLabels[3] = {"A", "B", "C"};
+    for (int i = 0; i < NUM_SWITCHES; i++)
+    {
+      if (!switchActive[i])
+        continue;
       display.setCursor(i * 43, 36);
       bool on = (switchStates[i] == 1);
       display.printf("Sw%s:%s", swLabels[i], on ? "ON" : "OF");
     }
   }
-  else if (displayPage == 1) {
-    // PAGE 1: RELAY SCHEDULES
-    drawOledHeader("- RELAY SCHED -");
+  else if (displayPage == 1)
+  {
+    // PAGE 1: ACTIVE SCHEDULES
+    drawOledHeader("- SCHEDULES -");
+    int activeCount = 0;
     int y = 12;
-    for (int r = 0; r < 4; r++) {
-      display.setCursor(0, y);
-      display.printf("R%d:", r + 1);
-      int activeCount = 0;
-      for (int j = 0; j < MAX_JOBS; j++) {
-        if (channelJobs[r][j].enabled) {
-          display.printf(" %02d:%02d%c", channelJobs[r][j].hour, channelJobs[r][j].minute, channelJobs[r][j].action ? '+' : '-');
-          activeCount++;
-          if (activeCount >= 2) break; // fit on row
-        }
+    for (int i = 0; i < MAX_SCHEDULES; i++)
+    {
+      if (schedules[i].enabled && y < 50)
+      {
+        display.setCursor(0, y);
+        display.printf("%02d:%02d %s", schedules[i].hour, schedules[i].minute,
+                       schedules[i].action ? "ON" : "OFF");
+        y += 10;
+        activeCount++;
       }
-      if (activeCount == 0) display.print(" No Sched");
-      y += 10;
+    }
+    if (activeCount == 0)
+    {
+      display.setCursor(20, 26);
+      display.print("No Active Schedules");
     }
   }
-  else if (displayPage == 2) {
-    // PAGE 2: SWITCH SCHEDULES
-    drawOledHeader("- SWITCH SCHED -");
-    const char swNames[3] = {'A', 'B', 'C'};
-    int y = 14;
-    for (int s = 0; s < 3; s++) {
-      int ch = 4 + s;
-      display.setCursor(0, y);
-      display.printf("Sw%c:", swNames[s]);
-      int activeCount = 0;
-      for (int j = 0; j < MAX_JOBS; j++) {
-        if (channelJobs[ch][j].enabled) {
-          display.printf(" %02d:%02d%c", channelJobs[ch][j].hour, channelJobs[ch][j].minute, channelJobs[ch][j].action ? '+' : '-');
-          activeCount++;
-          if (activeCount >= 2) break;
-        }
-      }
-      if (activeCount == 0) display.print(" No Sched");
-      y += 12;
-    }
-  }
-  else if (displayPage == 3) {
-    // PAGE 3: ACTIVE TIMERS
+  else if (displayPage == 2)
+  {
+    // PAGE 2: ACTIVE TIMERS
     drawOledHeader("- TIMERS LIST -");
     int activeTimersCount = 0;
     int y = 14;
-    for (int i = 0; i < MAX_TIMERS; i++) {
-      if (timers[i].active) {
+    for (int i = 0; i < MAX_TIMERS; i++)
+    {
+      if (timers[i].active)
+      {
         activeTimersCount++;
-        if (y < 50) {
+        if (y < 50)
+        {
           uint32_t sec = timers[i].remainingSec;
           uint32_t h = sec / 3600;
           uint32_t m = (sec % 3600) / 60;
@@ -570,7 +763,8 @@ void updateOLED() {
         }
       }
     }
-    if (activeTimersCount == 0) {
+    if (activeTimersCount == 0)
+    {
       display.setCursor(20, 26);
       display.print("No Active Timers");
     }
@@ -580,48 +774,54 @@ void updateOLED() {
   display.display();
 }
 
-void drawOledCountdown(int secondsRemaining) {
-  if (!oledConnected) return;
+void drawOledCountdown(int secondsRemaining)
+{
+  if (!oledConnected)
+    return;
   display.clearDisplay();
   drawOledHeader("- TOGGLE POLARITY -");
-
   display.setTextSize(1);
   display.setCursor(0, 14);
   display.println("Keep holding button");
   display.println("to switch polarity!");
-
   display.setCursor(32, 36);
   display.setTextSize(2);
   display.printf("in %ds", secondsRemaining);
-
   drawOledFooter();
   display.display();
 }
 
-void handleButtonPress() {
+void handleButtonPress()
+{
   bool currentButtonState = digitalRead(BUTTON_PIN);
 
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
+  if (lastButtonState == HIGH && currentButtonState == LOW)
+  {
     buttonPressTime = millis();
     isHolding = false;
   }
-  else if (lastButtonState == LOW && currentButtonState == LOW) {
+  else if (lastButtonState == LOW && currentButtonState == LOW)
+  {
     unsigned long duration = millis() - buttonPressTime;
-    if (duration >= 1000 && duration < 11000) {
+    if (duration >= 1000 && duration < 11000)
+    {
       isHolding = true;
       int elapsedSeconds = (duration - 1000) / 1000;
       int remaining = 10 - elapsedSeconds;
-      if (remaining < 0) remaining = 0;
-
+      if (remaining < 0)
+        remaining = 0;
       static int lastDisplayedSec = -1;
-      if (lastDisplayedSec != remaining) {
+      if (lastDisplayedSec != remaining)
+      {
         lastDisplayedSec = remaining;
         drawOledCountdown(remaining);
       }
     }
-    else if (duration >= 11000) {
+    else if (duration >= 11000)
+    {
       setRelayPolarityAndForceOff(!activeLow);
-      if (oledConnected) {
+      if (oledConnected)
+      {
         display.clearDisplay();
         drawOledHeader("- TOGGLE POLARITY -");
         display.setTextSize(1);
@@ -638,13 +838,16 @@ void handleButtonPress() {
       updateOLED();
     }
   }
-  else if (lastButtonState == LOW && currentButtonState == HIGH) {
+  else if (lastButtonState == LOW && currentButtonState == HIGH)
+  {
     unsigned long duration = millis() - buttonPressTime;
-    if (!isHolding && duration < 1000) {
-      displayPage = (displayPage + 1) % 4; // 4 Pages
+    if (!isHolding && duration < 1000)
+    {
+      displayPage = (displayPage + 1) % 3; // 3 Pages
       updateOLED();
     }
-    else if (isHolding) {
+    else if (isHolding)
+    {
       updateOLED();
     }
     isHolding = false;
@@ -653,57 +856,75 @@ void handleButtonPress() {
 }
 
 // ---------------------------------------------------------------- REST API Endpoints
-void setupAPI() {
+void setupAPI()
+{
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
 
-  server.onNotFound([](AsyncWebServerRequest *request) {
+  server.onNotFound([](AsyncWebServerRequest *request)
+                    {
     if (request->method() == HTTP_OPTIONS) {
       request->send(200);
     } else {
       request->send(404, "application/json", "{\"status\":\"Error\",\"message\":\"Not Found\"}");
-    }
-  });
+    } });
 
-  // 1. GET Capabilities (Smart Discovery)
-  server.on("/api/capabilities", HTTP_GET, [](AsyncWebServerRequest *request) {
+  // 1. GET /api/capabilities (Smart Discovery)
+  server.on("/api/capabilities", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
     JsonDocument doc;
-    doc["device_name"] = "R-Sync ESP32 Server";
-    doc["version"] = "2.0.0";
-    doc["relays_count"] = NUM_RELAYS;
-    doc["switches_count"] = NUM_SWITCHES;
-    doc["servos_count"] = NUM_SERVOS;
-    doc["timer_feature"] = true;
-    doc["max_timers"] = MAX_TIMERS;
-    doc["scheduler_feature"] = true;
-    doc["max_schedules_per_channel"] = MAX_JOBS;
-    doc["servo_config_feature"] = true;
+    doc["device_name"]    = "R-Sync ESP32 Server";
+    doc["version"]        = "3.0.0";
+    doc["oled_connected"] = oledConnected;
+
+    // Count active relays/switches
+    int activeRelayCount   = 0;
+    int activeSwitchCount  = 0;
+    JsonArray rActive = doc["active_relays"].to<JsonArray>();
+    JsonArray sActive = doc["active_switches"].to<JsonArray>();
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      rActive.add(relayActive[i]);
+      if (relayActive[i]) activeRelayCount++;
+    }
+    for (int i = 0; i < NUM_SWITCHES; i++) {
+      sActive.add(switchActive[i]);
+      if (switchActive[i]) activeSwitchCount++;
+    }
+    doc["relays_count"]             = activeRelayCount;
+    doc["switches_count"]           = activeSwitchCount;
+    doc["servos_count"]             = NUM_SERVOS;
+    doc["timer_feature"]            = true;
+    doc["max_timers"]               = MAX_TIMERS;
+    doc["scheduler_feature"]        = true;
+    doc["max_schedules"]            = MAX_SCHEDULES;
+    doc["servo_config_feature"]     = true;
 
     String response;
     serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
+    request->send(200, "application/json", response); });
 
-  // 2. GET System Status
-  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+  // 2. GET /api/status
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
     JsonDocument doc;
-    doc["ip"] = WiFi.localIP().toString();
+    doc["ip"]   = WiFi.localIP().toString();
     doc["wifi"] = WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
 
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
-      char timeStringBuff[50];
-      strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      doc["time"] = String(timeStringBuff);
+      char buf[50];
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      doc["time"] = String(buf);
     } else {
       doc["time"] = "Not Synced";
     }
 
-    doc["activeLow"] = activeLow;
-    doc["displayPage"] = displayPage;
-    doc["restAngle"] = restAngle;
-    doc["pressAngle"] = pressAngle;
+    doc["activeLow"]      = activeLow;
+    doc["displayPage"]    = displayPage;
+    doc["oledConnected"]  = oledConnected;
+    doc["restAngle"]      = restAngle;
+    doc["pressAngle"]     = pressAngle;
     doc["pressDurationMs"] = pressDurationMs;
 
     // Relays
@@ -711,40 +932,56 @@ void setupAPI() {
     for (int r = 1; r <= NUM_RELAYS; r++) {
       rArr.add(getRelay(r) ? "ON" : "OFF");
     }
+    JsonArray rActiveArr = doc["relayActive"].to<JsonArray>();
+    for (int r = 0; r < NUM_RELAYS; r++) rActiveArr.add(relayActive[r]);
 
     // Switches
     JsonArray sArr = doc["switches"].to<JsonArray>();
     for (int s = 0; s < NUM_SWITCHES; s++) {
       sArr.add(switchStates[s] == 1 ? "ON" : "OFF");
     }
+    JsonArray sActiveArr = doc["switchActive"].to<JsonArray>();
+    for (int s = 0; s < NUM_SWITCHES; s++) sActiveArr.add(switchActive[s]);
 
     // Active Timers
     JsonArray tArr = doc["timers"].to<JsonArray>();
     for (int i = 0; i < MAX_TIMERS; i++) {
       if (timers[i].active) {
         JsonObject obj = tArr.add<JsonObject>();
-        obj["id"] = timers[i].id;
+        obj["id"]              = timers[i].id;
         obj["totalDurationSec"] = timers[i].totalDurationSec;
-        obj["remainingSec"] = timers[i].remainingSec;
-        obj["paused"] = timers[i].paused;
+        obj["remainingSec"]    = timers[i].remainingSec;
+        obj["paused"]          = timers[i].paused;
         obj["invertOnStartEnd"] = timers[i].invertOnStartEnd;
-        obj["targetAction"] = timers[i].targetAction ? "ON" : "OFF";
-        
-        JsonArray rTargets = obj["targetRelays"].to<JsonArray>();
-        for (int r = 0; r < NUM_RELAYS; r++) rTargets.add(timers[i].targetRelays[r]);
-        JsonArray sTargets = obj["targetSwitches"].to<JsonArray>();
-        for (int s = 0; s < NUM_SWITCHES; s++) sTargets.add(timers[i].targetSwitches[s]);
+        obj["targetAction"]    = timers[i].targetAction ? "ON" : "OFF";
+        JsonArray rT = obj["targetRelays"].to<JsonArray>();
+        for (int r = 0; r < NUM_RELAYS; r++) rT.add(timers[i].targetRelays[r]);
+        JsonArray sT = obj["targetSwitches"].to<JsonArray>();
+        for (int s = 0; s < NUM_SWITCHES; s++) sT.add(timers[i].targetSwitches[s]);
       }
+    }
+
+    // Schedules
+    JsonArray schArr = doc["schedules"].to<JsonArray>();
+    for (int i = 0; i < MAX_SCHEDULES; i++) {
+      JsonObject obj = schArr.add<JsonObject>();
+      obj["h"] = schedules[i].hour;
+      obj["m"] = schedules[i].minute;
+      obj["a"] = schedules[i].action ? "ON" : "OFF";
+      obj["e"] = schedules[i].enabled;
+      JsonArray rS = obj["r"].to<JsonArray>();
+      for (int r = 0; r < NUM_RELAYS; r++) rS.add(schedules[i].targetRelays[r]);
+      JsonArray sS = obj["s"].to<JsonArray>();
+      for (int sw = 0; sw < NUM_SWITCHES; sw++) sS.add(schedules[i].targetSwitches[sw]);
     }
 
     String response;
     serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
+    request->send(200, "application/json", response); });
 
-  // 3. POST /api/relay (Control Relay 1..4)
-  server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  // 3. POST /api/relay
+  server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
@@ -756,12 +993,11 @@ void setupAPI() {
           return;
         }
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Relay\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Relay\"}"); });
 
-  // 4. POST /api/switch (Control Wall Switch A..C / Index 0..2)
-  server.on("/api/switch", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  // 4. POST /api/switch
+  server.on("/api/switch", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
@@ -773,35 +1009,33 @@ void setupAPI() {
           return;
         }
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Switch\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Switch\"}"); });
 
-  // 5. POST /api/servo/test (Trigger 3x Self-Test movement)
-  server.on("/api/servo/test", HTTP_ANY, [](AsyncWebServerRequest *request) {
+  // 5. POST /api/servo/test
+  server.on("/api/servo/test", HTTP_ANY, [](AsyncWebServerRequest *request)
+            {
     runServoSelfTest();
-    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test completed\"}");
-  });
+    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}"); });
 
-  // 6. POST /api/servo/config (Calibrate Rest & Press Angles)
-  server.on("/api/servo/config", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  // 6. POST /api/servo/config
+  server.on("/api/servo/config", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        if (doc["restAngle"].is<uint8_t>()) restAngle = doc["restAngle"].as<uint8_t>();
-        if (doc["pressAngle"].is<uint8_t>()) pressAngle = doc["pressAngle"].as<uint8_t>();
+        if (doc["restAngle"].is<uint8_t>())    restAngle      = doc["restAngle"].as<uint8_t>();
+        if (doc["pressAngle"].is<uint8_t>())   pressAngle     = doc["pressAngle"].as<uint8_t>();
         if (doc["pressDurationMs"].is<uint16_t>()) pressDurationMs = doc["pressDurationMs"].as<uint16_t>();
         saveServoConfig();
         applyRestAngleImmediately();
         request->send(200, "application/json", "{\"status\":\"OK\"}");
         return;
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Servo Config\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Servo Config\"}"); });
 
   // 7. POST /api/relay/polarity
-  server.on("/api/relay/polarity", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  server.on("/api/relay/polarity", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error && doc["activeLow"].is<bool>()) {
@@ -809,165 +1043,218 @@ void setupAPI() {
         request->send(200, "application/json", "{\"status\":\"OK\"}");
         return;
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Polarity Payload\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Polarity Payload\"}"); });
 
-  // 8. GET & POST /api/schedule
-  server.on("/api/schedules", HTTP_GET, [](AsyncWebServerRequest *request) {
+  // 8. GET /api/schedules — Return all schedule entries
+  server.on("/api/schedules", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
     JsonDocument doc;
-    JsonArray chArray = doc.to<JsonArray>();
-    for (int ch = 0; ch < 7; ch++) {
-      JsonObject chObj = chArray.add<JsonObject>();
-      chObj["channel"] = ch;
-      JsonArray jArr = chObj["jobs"].to<JsonArray>();
-      for (int i = 0; i < MAX_JOBS; i++) {
-        JsonObject job = jArr.add<JsonObject>();
-        job["h"] = channelJobs[ch][i].hour;
-        job["m"] = channelJobs[ch][i].minute;
-        job["a"] = channelJobs[ch][i].action ? "ON" : "OFF";
-        job["e"] = channelJobs[ch][i].enabled;
-      }
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < MAX_SCHEDULES; i++) {
+      JsonObject obj = arr.add<JsonObject>();
+      obj["h"] = schedules[i].hour;
+      obj["m"] = schedules[i].minute;
+      obj["a"] = schedules[i].action ? "ON" : "OFF";
+      obj["e"] = schedules[i].enabled;
+      JsonArray rS = obj["r"].to<JsonArray>();
+      for (int r = 0; r < NUM_RELAYS; r++) rS.add(schedules[i].targetRelays[r]);
+      JsonArray sS = obj["s"].to<JsonArray>();
+      for (int s = 0; s < NUM_SWITCHES; s++) sS.add(schedules[i].targetSwitches[s]);
     }
     String response;
     serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
+    request->send(200, "application/json", response); });
 
-  server.on("/api/schedule", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  // 9. POST /api/schedules — Save full schedule list
+  server.on("/api/schedules", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        int ch = doc["channel"] | -1;
-        JsonArray arr = doc["jobs"].as<JsonArray>();
-        if (ch >= 0 && ch < 7) {
-          for (int i = 0; i < MAX_JOBS && i < arr.size(); i++) {
-            channelJobs[ch][i].hour = arr[i]["h"] | 0;
-            channelJobs[ch][i].minute = arr[i]["m"] | 0;
-            channelJobs[ch][i].action = (arr[i]["a"] == "ON");
-            channelJobs[ch][i].enabled = arr[i]["e"] | false;
-          }
-          saveJobs();
-          request->send(200, "application/json", "{\"status\":\"OK\"}");
-          return;
+        JsonArray arr = doc.as<JsonArray>();
+        // Reset all first
+        for (int i = 0; i < MAX_SCHEDULES; i++) {
+          schedules[i] = ScheduleEntry();
+          schedules[i].hour = 0; schedules[i].minute = 0;
+          schedules[i].action = false; schedules[i].enabled = false;
+          for (int r = 0; r < NUM_RELAYS; r++) schedules[i].targetRelays[r] = false;
+          for (int s = 0; s < NUM_SWITCHES; s++) schedules[i].targetSwitches[s] = false;
         }
+        int i = 0;
+        for (JsonObject obj : arr) {
+          if (i >= MAX_SCHEDULES) break;
+          schedules[i].hour    = obj["h"] | 0;
+          schedules[i].minute  = obj["m"] | 0;
+          schedules[i].action  = (obj["a"] | String("OFF")) == "ON";
+          schedules[i].enabled = obj["e"] | false;
+          JsonArray rArr = obj["r"].as<JsonArray>();
+          for (int r = 0; r < NUM_RELAYS; r++) {
+            schedules[i].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
+          }
+          JsonArray sArr = obj["s"].as<JsonArray>();
+          for (int s = 0; s < NUM_SWITCHES; s++) {
+            schedules[i].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
+          }
+          i++;
+        }
+        saveSchedules();
+        request->send(200, "application/json", "{\"status\":\"OK\"}");
+        return;
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Schedule\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Schedules\"}"); });
 
-  // 9. Timer APIs: POST /api/timer/add, POST /api/timer/control
-  server.on("/api/timer/add", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  // 10. Timer APIs
+  server.on("/api/timer/add", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        // Find free timer slot
         int freeSlot = -1;
         for (int i = 0; i < MAX_TIMERS; i++) {
-          if (!timers[i].active) {
-            freeSlot = i;
-            break;
-          }
+          if (!timers[i].active) { freeSlot = i; break; }
         }
         if (freeSlot != -1) {
-          timers[freeSlot].id = nextTimerId++;
+          timers[freeSlot].id               = nextTimerId++;
           timers[freeSlot].totalDurationSec = doc["durationSec"] | 0;
-          timers[freeSlot].remainingSec = timers[freeSlot].totalDurationSec;
-          timers[freeSlot].paused = false;
-          timers[freeSlot].active = true;
+          timers[freeSlot].remainingSec     = timers[freeSlot].totalDurationSec;
+          timers[freeSlot].paused           = false;
+          timers[freeSlot].active           = true;
           timers[freeSlot].invertOnStartEnd = doc["invertOnStartEnd"] | false;
-          timers[freeSlot].targetAction = (doc["targetAction"] == "ON");
+          timers[freeSlot].targetAction     = (doc["targetAction"] == "ON");
 
           JsonArray rArr = doc["targetRelays"].as<JsonArray>();
           for (int r = 0; r < NUM_RELAYS; r++) {
-            timers[freeSlot].targetRelays[r] = (r < rArr.size()) ? rArr[r].as<bool>() : false;
+            timers[freeSlot].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
           }
           JsonArray sArr = doc["targetSwitches"].as<JsonArray>();
           for (int s = 0; s < NUM_SWITCHES; s++) {
-            timers[freeSlot].targetSwitches[s] = (s < sArr.size()) ? sArr[s].as<bool>() : false;
+            timers[freeSlot].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
           }
 
-          // If invertOnStartEnd is checked, execute opposite state on timer START!
           if (timers[freeSlot].invertOnStartEnd) {
             applyTimerTargets(timers[freeSlot], !timers[freeSlot].targetAction);
           }
 
-          request->send(200, "application/json", "{\"status\":\"OK\",\"id\":" + String(timers[freeSlot].id) + "}");
+          saveTimers();
+          request->send(200, "application/json",
+                        "{\"status\":\"OK\",\"id\":" + String(timers[freeSlot].id) + "}");
           return;
         } else {
           request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer slots full\"}");
           return;
         }
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Add Timer\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Add Timer\"}"); });
 
-  server.on("/api/timer/control", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  server.on("/api/timer/control", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        int id = doc["id"] | 0;
-        String cmd = doc["command"] | ""; // "pause", "resume", "cancel"
+        int id     = doc["id"] | 0;
+        String cmd = doc["command"] | "";
         for (int i = 0; i < MAX_TIMERS; i++) {
           if (timers[i].active && timers[i].id == id) {
-            if (cmd == "pause") timers[i].paused = true;
+            if (cmd == "pause")  timers[i].paused = true;
             else if (cmd == "resume") timers[i].paused = false;
             else if (cmd == "cancel") timers[i].active = false;
+            saveTimers();
             request->send(200, "application/json", "{\"status\":\"OK\"}");
             return;
           }
         }
       }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer not found\"}");
-    });
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer not found\"}"); });
 
-  // 10. POST /api/display
-  server.on("/api/display", HTTP_ANY, [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  // 11. POST /api/display
+  server.on("/api/display", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error && doc["page"].is<int>()) {
-        displayPage = doc["page"].as<int>() % 4;
+        displayPage = doc["page"].as<int>() % 3;
       } else {
-        displayPage = (displayPage + 1) % 4;
+        displayPage = (displayPage + 1) % 3;
       }
       updateOLED();
-      request->send(200, "application/json", "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}");
-    });
+      request->send(200, "application/json",
+                    "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}"); });
 
-  // 11. Reset WiFi
-  server.on("/api/wifi/reset", HTTP_ANY, [](AsyncWebServerRequest *request) {
+  // 12. GET /api/hardware/config — Get hardware active state
+  server.on("/api/hardware/config", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    JsonDocument doc;
+    JsonArray rArr = doc["relays"].to<JsonArray>();
+    for (int i = 0; i < NUM_RELAYS; i++) rArr.add(relayActive[i]);
+    JsonArray sArr = doc["switches"].to<JsonArray>();
+    for (int i = 0; i < NUM_SWITCHES; i++) sArr.add(switchActive[i]);
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response); });
+
+  // 13. POST /api/hardware/config — Set hardware active/inactive per relay/switch
+  server.on("/api/hardware/config", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, data, len);
+      if (!error) {
+        if (doc["relays"].is<JsonArray>()) {
+          JsonArray rArr = doc["relays"].as<JsonArray>();
+          for (int i = 0; i < NUM_RELAYS && i < (int)rArr.size(); i++) {
+            relayActive[i] = rArr[i].as<bool>();
+            if (!relayActive[i]) {
+              // Force off disabled relay
+              digitalWrite(RELAY_PINS[i], relayOffLevel);
+            }
+          }
+        }
+        if (doc["switches"].is<JsonArray>()) {
+          JsonArray sArr = doc["switches"].as<JsonArray>();
+          for (int i = 0; i < NUM_SWITCHES && i < (int)sArr.size(); i++) {
+            switchActive[i] = sArr[i].as<bool>();
+          }
+        }
+        saveHardwareConfig();
+        request->send(200, "application/json", "{\"status\":\"OK\"}");
+        return;
+      }
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Hardware Config Payload\"}"); });
+
+  // 14. Reset WiFi
+  server.on("/api/wifi/reset", HTTP_ANY, [](AsyncWebServerRequest *request)
+            {
     request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Resetting WiFi...\"}");
     delay(600);
     WiFiManager wm;
     wm.resetSettings();
-    ESP.restart();
-  });
+    ESP.restart(); });
 }
 
 // ---------------------------------------------------------------- SETUP
-void setup() {
+void setup()
+{
   Serial.begin(115200);
 
-  for (int r = 0; r < NUM_RELAYS; r++) {
+  for (int r = 0; r < NUM_RELAYS; r++)
+  {
     pinMode(RELAY_PINS[r], OUTPUT);
   }
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   loadPolarity();
-  for (int r = 1; r <= NUM_RELAYS; r++) {
+  loadHardwareConfig();
+  for (int r = 1; r <= NUM_RELAYS; r++)
+  {
     setRelay(r, false);
   }
 
- // OLED Init - Safe Detection
+  // OLED Init - Safe Detection
   Wire.begin(OLED_SDA, OLED_SCL);
-  
-  // Cek keberadaan hardware I2C terlebih dahulu (I2C Ping)
   Wire.beginTransmission(0x3C);
-  if (Wire.endTransmission() == 0) {
-    // Alamat 0x3C merespon, baru inisialisasi display
-    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  if (Wire.endTransmission() == 0)
+  {
+    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+    {
       oledConnected = true;
       display.clearDisplay();
       drawOledHeader("- SYSTEM START -");
@@ -976,26 +1263,29 @@ void setup() {
       display.println("Please wait...");
       drawOledFooter();
       display.display();
-    } else {
+    }
+    else
+    {
       oledConnected = false;
       Serial.println(F("[I2C] SSD1306 allocation failed"));
     }
-  } else {
-    // OLED Tidak Terpasang
+  }
+  else
+  {
     oledConnected = false;
     Serial.println(F("[I2C] OLED SSD1306 not detected on 0x3C. Skipping display operations."));
   }
 
-  loadJobs();
-
-  // NOTE: Self-test is NOT run at boot automatically.
-  // Trigger it via POST /api/servo/test from the Flutter app.
+  loadSchedules();
+  loadTimers();
 
   // Instant WiFi Reset if BOOT button held down during startup
   bool forcePortal = false;
-  if (digitalRead(BUTTON_PIN) == LOW) {
+  if (digitalRead(BUTTON_PIN) == LOW)
+  {
     forcePortal = true;
-    if (oledConnected) {
+    if (oledConnected)
+    {
       display.clearDisplay();
       drawOledHeader("- FACTORY RESET -");
       display.setCursor(0, 14);
@@ -1013,7 +1303,8 @@ void setup() {
   wm.setConnectTimeout(60);
   wm.setConfigPortalTimeout(120);
 
-  wm.setAPCallback([](WiFiManager *myWiFiManager) {
+  wm.setAPCallback([](WiFiManager *myWiFiManager)
+                   {
     if (oledConnected) {
       display.clearDisplay();
       drawOledHeader("- CONFIG PORTAL -");
@@ -1023,13 +1314,14 @@ void setup() {
       display.println("IP: 192.168.4.1");
       drawOledFooter();
       display.display();
-    }
-  });
+    } });
 
   bool wifiConfigured = false;
-  wm.setSaveConfigCallback([&wifiConfigured]() { wifiConfigured = true; });
+  wm.setSaveConfigCallback([&wifiConfigured]()
+                           { wifiConfigured = true; });
 
-  if (oledConnected && !forcePortal) {
+  if (oledConnected && !forcePortal)
+  {
     display.clearDisplay();
     drawOledHeader("- WIFI CONNECT -");
     display.setCursor(0, 14);
@@ -1041,20 +1333,26 @@ void setup() {
   }
 
   bool res = false;
-  if (forcePortal) {
+  if (forcePortal)
+  {
     wm.resetSettings();
     res = wm.startConfigPortal("R-Sync");
-  } else {
+  }
+  else
+  {
     res = wm.autoConnect("R-Sync");
   }
 
-  if (!res) {
+  if (!res)
+  {
     Serial.println("Failed to connect or portal timeout");
     ESP.restart();
   }
 
-  if (wifiConfigured || forcePortal) {
-    if (oledConnected) {
+  if (wifiConfigured || forcePortal)
+  {
+    if (oledConnected)
+    {
       display.clearDisplay();
       drawOledHeader("- CONFIG SAVED -");
       display.setCursor(0, 18);
@@ -1070,7 +1368,8 @@ void setup() {
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
 
-  if (oledConnected) {
+  if (oledConnected)
+  {
     display.clearDisplay();
     drawOledHeader("- WIFI CONNECTED -");
     display.setCursor(0, 18);
@@ -1085,7 +1384,8 @@ void setup() {
   // OTA Setup
   ArduinoOTA.setHostname("r-sync");
   ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([]() {
+  ArduinoOTA.onStart([]()
+                     {
     ota_updating = true;
     if (oledConnected) {
       display.clearDisplay();
@@ -1095,12 +1395,11 @@ void setup() {
       display.println("Please wait...");
       drawOledFooter();
       display.display();
-    }
-  });
-  ArduinoOTA.onEnd([]() {
-    ota_updating = false;
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    } });
+  ArduinoOTA.onEnd([]()
+                   { ota_updating = false; });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
+                        {
     if (oledConnected) {
       int percentage = (progress / (total / 100));
       display.clearDisplay();
@@ -1111,55 +1410,65 @@ void setup() {
       display.printf("Progress: %u%%", percentage);
       drawOledFooter();
       display.display();
-    }
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    ota_updating = false;
-  });
+    } });
+  ArduinoOTA.onError([](ota_error_t error)
+                     { ota_updating = false; });
   ArduinoOTA.begin();
 
   setupAPI();
   server.begin();
+
+  Serial.println("[R-Sync] v3.0.0 Ready.");
+  Serial.printf("[R-Sync] OLED: %s\n", oledConnected ? "Connected" : "Not found");
 }
 
 // ---------------------------------------------------------------- LOOP
 unsigned long lastTimerTick = 0;
 
-void loop() {
+void loop()
+{
   ArduinoOTA.handle();
 
-  if (ota_updating) {
+  if (ota_updating)
+  {
     delay(10);
     return;
   }
 
   handleButtonPress();
   updateServos();
-  updateServoSelfTest(); // non-blocking self-test state machine
+  updateServoSelfTest();
 
   unsigned long currentMillis = millis();
 
   // Tick countdown timers every 1000ms
-  if (currentMillis - lastTimerTick >= 1000) {
+  if (currentMillis - lastTimerTick >= 1000)
+  {
     lastTimerTick = currentMillis;
     tickTimers();
   }
 
   // Refresh OLED and check NTP schedules every 1000ms
-  if (currentMillis - lastOledUpdate >= 1000) {
+  if (currentMillis - lastOledUpdate >= 1000)
+  {
     lastOledUpdate = currentMillis;
 
     struct tm timeinfo;
-    bool gotTime = getLocalTime(&timeinfo, 10);
-    if (gotTime) {
-      if (!ntpSynced) {
+    bool gotTime = getLocalTime(&timeinfo, 0); // 0ms timeout (non-blocking)
+    if (gotTime)
+    {
+      if (!ntpSynced)
+      {
         ntpSynced = true;
-      } else {
+      }
+      else
+      {
         checkSchedules(timeinfo.tm_hour, timeinfo.tm_min);
       }
     }
 
-    if (!isHolding) {
+    if (!isHolding)
+    {
       updateOLED();
     }
   }
