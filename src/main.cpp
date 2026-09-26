@@ -3,21 +3,11 @@
  * @brief R-Sync ESP32 Local Server Firmware (Combined 4 Relays + 6 Servos + Timers + Scheduler)
  * @author Zenalghi
  * @version 3.0.0
- *
- * Repositories:
- * - Firmware ESP32: https://github.com/Zenalghi/relay-local-server
- * - Flutter Client: https://github.com/Zenalghi/r_sync_app
- *
- * Changelog v3.0.0:
- * - Timer persistence: saved/loaded from Preferences (survives reboot)
- * - Scheduler redesigned: global list (max 10), multi-channel per entry
- * - Hardware pin config: relay/switch can be disabled via API + Preferences
- * - Capabilities API: oled_connected, active_relays[], active_switches[]
- * - MAX_JOBS per channel increased to 10 (scheduler global)
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h> // Tambahan untuk pengatur Power Save WiFi
 #include <WiFiManager.h>
 
 // WiFiManager includes WebServer.h which uses http_parser sequential enums (0,1,2,3...).
@@ -60,17 +50,13 @@ const uint8_t RELAY_PINS[NUM_RELAYS] = {4, 16, 17, 5}; // Relay 1, 2, 3, 4
 
 #define NUM_SWITCHES 3
 #define NUM_SERVOS 6
-// Switch A: Servo 0 (ON) Pin 14, Servo 1 (OFF) Pin 27
-// Switch B: Servo 2 (ON) Pin 26, Servo 3 (OFF) Pin 25
-// Switch C: Servo 4 (ON) Pin 33, Servo 5 (OFF) Pin 32
 const uint8_t SERVO_PINS[NUM_SERVOS] = {14, 27, 26, 25, 33, 32};
 
 #define BUTTON_PIN 0
 #define OLED_SDA 21
 #define OLED_SCL 22
 
-// ---------------------------------------------------------------- Hardware Active Flags (runtime configurable)
-// These can be toggled via API and are stored in Preferences
+// ---------------------------------------------------------------- Hardware Active Flags
 bool relayActive[NUM_RELAYS] = {true, true, true, true};
 bool switchActive[NUM_SWITCHES] = {true, true, true};
 
@@ -94,10 +80,8 @@ uint8_t restAngle = 90;
 uint8_t pressAngle = 0;
 uint16_t pressDurationMs = 400;
 
-// Switch state memory (0: OFF, 1: ON, -1: Unknown)
 int switchStates[NUM_SWITCHES] = {0, 0, 0};
 
-// Non-blocking servo pulse structure
 struct ServoAction
 {
   uint8_t servoIdx;
@@ -111,15 +95,14 @@ struct ServoAction
 #define MAX_SERVO_ACTIONS 6
 ServoAction servoActions[MAX_SERVO_ACTIONS];
 
-// ---------------------------------------------------------------- Scheduler (Global, Multi-Channel)
-// Each schedule entry can target multiple relays AND switches simultaneously
+// ---------------------------------------------------------------- Scheduler
 #define MAX_SCHEDULES 10
 
 struct ScheduleEntry
 {
   uint8_t hour;
   uint8_t minute;
-  bool action; // true = ON, false = OFF
+  bool action;
   bool enabled;
   bool targetRelays[NUM_RELAYS];
   bool targetSwitches[NUM_SWITCHES];
@@ -139,6 +122,7 @@ struct TimerItem
   uint32_t remainingSec;
   bool paused;
   bool active;
+  bool finished; // Completed timers are kept & persisted as history
   bool invertOnStartEnd;
   bool targetAction;
   bool targetRelays[NUM_RELAYS];
@@ -157,14 +141,12 @@ unsigned long buttonPressTime = 0;
 bool isHolding = false;
 unsigned long lastOledUpdate = 0;
 
-// Function declarations
 void updateOLED();
 void setRelay(int channel, bool state);
 bool getRelay(int channel);
 void triggerSwitch(int switchIdx, bool turnOn);
 void runServoSelfTest();
 
-// Self-test flag
 volatile bool servoTestRequested = false;
 
 // ---------------------------------------------------------------- Polarity Load/Save
@@ -185,7 +167,8 @@ void applyPolarity(bool isActiveLow)
 
 void loadPolarity()
 {
-  preferences.begin("cfg", true);
+  // Gunakan false agar namespace dibuat otomatis jika belum ada di NVS
+  preferences.begin("cfg", false);
   bool stored = preferences.getBool("activeLow", true);
   restAngle = preferences.getUChar("restAngle", 90);
   pressAngle = preferences.getUChar("pressAngle", 0);
@@ -213,7 +196,7 @@ void saveServoConfig()
 // ---------------------------------------------------------------- Hardware Active Config Load/Save
 void loadHardwareConfig()
 {
-  preferences.begin("hwcfg", true);
+  preferences.begin("hwcfg", false);
   for (int i = 0; i < NUM_RELAYS; i++)
   {
     String key = "r" + String(i);
@@ -262,7 +245,7 @@ void setRelay(int channel, bool state)
   if (channel < 1 || channel > NUM_RELAYS)
     return;
   if (!relayActive[channel - 1])
-    return; // Skip disabled relay
+    return;
   digitalWrite(RELAY_PINS[channel - 1], state ? relayOnLevel : relayOffLevel);
 }
 
@@ -278,7 +261,7 @@ void setRelayPolarityAndForceOff(bool isActiveLow)
   applyPolarity(isActiveLow);
   for (int i = 1; i <= NUM_RELAYS; i++)
   {
-    digitalWrite(RELAY_PINS[i - 1], relayOffLevel); // Force via hardware
+    digitalWrite(RELAY_PINS[i - 1], relayOffLevel);
   }
   savePolarity();
 }
@@ -337,7 +320,7 @@ void triggerSwitch(int switchIdx, bool turnOn)
   if (switchIdx < 0 || switchIdx >= NUM_SWITCHES)
     return;
   if (!switchActive[switchIdx])
-    return; // Skip disabled switch
+    return;
   uint8_t servoIdx = (switchIdx * 2) + (turnOn ? 0 : 1);
   startServoMovement(servoIdx, pressAngle, pressDurationMs);
   switchStates[switchIdx] = turnOn ? 1 : 0;
@@ -357,7 +340,6 @@ void applyRestAngleImmediately()
   }
 }
 
-// Non-blocking self-test state machine
 struct ServoTestState
 {
   bool running = false;
@@ -440,10 +422,10 @@ void runServoSelfTest()
   selfTest.running = true;
 }
 
-// ---------------------------------------------------------------- Scheduler Load/Save (Global Multi-Channel)
+// ---------------------------------------------------------------- Scheduler Load/Save
 void loadSchedules()
 {
-  preferences.begin("sched2", true);
+  preferences.begin("sched2", false);
   String json = preferences.getString("entries", "[]");
   preferences.end();
 
@@ -555,13 +537,14 @@ void saveTimers()
   JsonArray arr = doc.to<JsonArray>();
   for (int i = 0; i < MAX_TIMERS; i++)
   {
-    if (timers[i].active)
+    if (timers[i].active || timers[i].finished)
     {
       JsonObject obj = arr.add<JsonObject>();
       obj["id"] = timers[i].id;
       obj["total"] = timers[i].totalDurationSec;
       obj["rem"] = timers[i].remainingSec;
       obj["pause"] = timers[i].paused;
+      obj["fin"] = timers[i].finished;
       obj["inv"] = timers[i].invertOnStartEnd;
       obj["act"] = timers[i].targetAction;
       JsonArray rArr = obj["r"].to<JsonArray>();
@@ -582,7 +565,7 @@ void saveTimers()
 
 void loadTimers()
 {
-  preferences.begin("timers", true);
+  preferences.begin("timers", false);
   String json = preferences.getString("active", "[]");
   nextTimerId = preferences.getInt("nextId", 1);
   preferences.end();
@@ -602,9 +585,10 @@ void loadTimers()
     timers[slot].totalDurationSec = obj["total"] | 0;
     timers[slot].remainingSec = obj["rem"] | 0;
     timers[slot].paused = obj["pause"] | false;
+    timers[slot].finished = obj["fin"] | false;
     timers[slot].invertOnStartEnd = obj["inv"] | false;
     timers[slot].targetAction = obj["act"] | false;
-    timers[slot].active = (timers[slot].remainingSec > 0);
+    timers[slot].active = (timers[slot].remainingSec > 0) && !timers[slot].finished;
 
     JsonArray rArr = obj["r"].as<JsonArray>();
     for (int r = 0; r < NUM_RELAYS; r++)
@@ -634,7 +618,9 @@ void tickTimers()
         if (timers[i].remainingSec == 0)
         {
           applyTimerTargets(timers[i], timers[i].targetAction);
+          // Keep the timer as finished history instead of deleting it
           timers[i].active = false;
+          timers[i].finished = true;
           changed = true;
         }
       }
@@ -670,11 +656,15 @@ void drawOledFooter()
   display.setCursor(0, 56);
   display.print("R-Sync");
 
-  struct tm timeinfo;
-  if (ntpSynced && getLocalTime(&timeinfo, 0))
+  // Non-blocking time retrieval
+  time_t now;
+  time(&now);
+  struct tm *timeinfo = localtime(&now);
+
+  if (ntpSynced && timeinfo && timeinfo->tm_year > (1970 - 1900))
   {
     char buf[9];
-    sprintf(buf, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    sprintf(buf, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     display.setCursor(80, 56);
     display.print(buf);
   }
@@ -686,12 +676,8 @@ void updateOLED()
     return;
   display.clearDisplay();
 
-  // Count active pages: 0 always shown, 1 if schedules exist, 2 if timers exist
-  int totalPages = 3;
-
   if (displayPage == 0)
   {
-    // PAGE 0: DEVICE STATUS
     drawOledHeader("- DEVICE STATUS -");
     display.setCursor(0, 12);
     display.print("WiFi: ");
@@ -719,7 +705,6 @@ void updateOLED()
   }
   else if (displayPage == 1)
   {
-    // PAGE 1: ACTIVE SCHEDULES
     drawOledHeader("- SCHEDULES -");
     int activeCount = 0;
     int y = 12;
@@ -742,13 +727,13 @@ void updateOLED()
   }
   else if (displayPage == 2)
   {
-    // PAGE 2: ACTIVE TIMERS
+    // PAGE 2: ACTIVE & FINISHED TIMERS
     drawOledHeader("- TIMERS LIST -");
     int activeTimersCount = 0;
     int y = 14;
     for (int i = 0; i < MAX_TIMERS; i++)
     {
-      if (timers[i].active)
+      if (timers[i].id > 0 && (timers[i].active || timers[i].finished || timers[i].totalDurationSec > 0))
       {
         activeTimersCount++;
         if (y < 50)
@@ -758,7 +743,8 @@ void updateOLED()
           uint32_t m = (sec % 3600) / 60;
           uint32_t s = sec % 60;
           display.setCursor(0, y);
-          display.printf("T#%d: %02u:%02u:%02u %s", timers[i].id, h, m, s, timers[i].paused ? "[P]" : "[R]");
+          const char *tag = timers[i].finished ? "[Done]" : (timers[i].paused ? "[P]" : "[R]");
+          display.printf("T#%d: %02u:%02u:%02u %s", timers[i].id, h, m, s, tag);
           y += 11;
         }
       }
@@ -766,7 +752,7 @@ void updateOLED()
     if (activeTimersCount == 0)
     {
       display.setCursor(20, 26);
-      display.print("No Active Timers");
+      display.print("No Timers");
     }
   }
 
@@ -843,7 +829,7 @@ void handleButtonPress()
     unsigned long duration = millis() - buttonPressTime;
     if (!isHolding && duration < 1000)
     {
-      displayPage = (displayPage + 1) % 3; // 3 Pages
+      displayPage = (displayPage + 1) % 3;
       updateOLED();
     }
     else if (isHolding)
@@ -870,7 +856,6 @@ void setupAPI()
       request->send(404, "application/json", "{\"status\":\"Error\",\"message\":\"Not Found\"}");
     } });
 
-  // 1. GET /api/capabilities (Smart Discovery)
   server.on("/api/capabilities", HTTP_GET, [](AsyncWebServerRequest *request)
             {
     JsonDocument doc;
@@ -878,7 +863,6 @@ void setupAPI()
     doc["version"]        = "3.0.0";
     doc["oled_connected"] = oledConnected;
 
-    // Count active relays/switches
     int activeRelayCount   = 0;
     int activeSwitchCount  = 0;
     JsonArray rActive = doc["active_relays"].to<JsonArray>();
@@ -904,17 +888,18 @@ void setupAPI()
     serializeJson(doc, response);
     request->send(200, "application/json", response); });
 
-  // 2. GET /api/status
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
             {
     JsonDocument doc;
     doc["ip"]   = WiFi.localIP().toString();
     doc["wifi"] = WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
 
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
+    time_t now;
+    time(&now);
+    struct tm *timeinfo = localtime(&now);
+    if (timeinfo && timeinfo->tm_year > (1970 - 1900)) {
       char buf[50];
-      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", timeinfo);
       doc["time"] = String(buf);
     } else {
       doc["time"] = "Not Synced";
@@ -927,7 +912,6 @@ void setupAPI()
     doc["pressAngle"]     = pressAngle;
     doc["pressDurationMs"] = pressDurationMs;
 
-    // Relays
     JsonArray rArr = doc["relays"].to<JsonArray>();
     for (int r = 1; r <= NUM_RELAYS; r++) {
       rArr.add(getRelay(r) ? "ON" : "OFF");
@@ -935,7 +919,6 @@ void setupAPI()
     JsonArray rActiveArr = doc["relayActive"].to<JsonArray>();
     for (int r = 0; r < NUM_RELAYS; r++) rActiveArr.add(relayActive[r]);
 
-    // Switches
     JsonArray sArr = doc["switches"].to<JsonArray>();
     for (int s = 0; s < NUM_SWITCHES; s++) {
       sArr.add(switchStates[s] == 1 ? "ON" : "OFF");
@@ -943,15 +926,15 @@ void setupAPI()
     JsonArray sActiveArr = doc["switchActive"].to<JsonArray>();
     for (int s = 0; s < NUM_SWITCHES; s++) sActiveArr.add(switchActive[s]);
 
-    // Active Timers
     JsonArray tArr = doc["timers"].to<JsonArray>();
     for (int i = 0; i < MAX_TIMERS; i++) {
-      if (timers[i].active) {
+      if (timers[i].active || timers[i].finished) {
         JsonObject obj = tArr.add<JsonObject>();
         obj["id"]              = timers[i].id;
         obj["totalDurationSec"] = timers[i].totalDurationSec;
         obj["remainingSec"]    = timers[i].remainingSec;
         obj["paused"]          = timers[i].paused;
+        obj["finished"]        = timers[i].finished;
         obj["invertOnStartEnd"] = timers[i].invertOnStartEnd;
         obj["targetAction"]    = timers[i].targetAction ? "ON" : "OFF";
         JsonArray rT = obj["targetRelays"].to<JsonArray>();
@@ -961,7 +944,6 @@ void setupAPI()
       }
     }
 
-    // Schedules
     JsonArray schArr = doc["schedules"].to<JsonArray>();
     for (int i = 0; i < MAX_SCHEDULES; i++) {
       JsonObject obj = schArr.add<JsonObject>();
@@ -979,9 +961,72 @@ void setupAPI()
     serializeJson(doc, response);
     request->send(200, "application/json", response); });
 
-  // 3. POST /api/relay
-  server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  // 3. POST & GET /api/relay/polarity and /api/polarity (Registered BEFORE /api/relay to prevent prefix routing collision!)
+  auto polarityHandler = [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  {
+    if (request->method() == HTTP_OPTIONS)
+      return;
+    if (len == 0)
+      return;
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, data, len);
+    if (!error && (doc["activeLow"].is<bool>() ||
+                   doc["activeLow"].is<int>() ||
+                   doc["activeLow"].is<const char *>()))
+    {
+      bool al = true;
+      if (doc["activeLow"].is<bool>())
+      {
+        al = doc["activeLow"].as<bool>();
+      }
+      else if (doc["activeLow"].is<int>())
+      {
+        al = (doc["activeLow"].as<int>() != 0);
+      }
+      else if (doc["activeLow"].is<const char *>())
+      {
+        String s = doc["activeLow"].as<const char *>();
+        al = (s.equalsIgnoreCase("true") || s == "1");
+      }
+      setRelayPolarityAndForceOff(al);
+      request->send(200, "application/json", "{\"status\":\"OK\",\"activeLow\":" + String(al ? "true" : "false") + "}");
+      return;
+    }
+    request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Polarity Payload\"}");
+  };
+
+  auto polarityReqHandler = [](AsyncWebServerRequest *request)
+  {
+    if (request->method() == HTTP_OPTIONS)
+    {
+      request->send(200);
+      return;
+    }
+    if (request->hasParam("activeLow"))
+    {
+      String p = request->getParam("activeLow")->value();
+      bool al = (p.equalsIgnoreCase("true") || p == "1");
+      setRelayPolarityAndForceOff(al);
+      request->send(200, "application/json", "{\"status\":\"OK\",\"activeLow\":" + String(al ? "true" : "false") + "}");
+      return;
+    }
+    if (request->method() == HTTP_GET)
+    {
+      request->send(200, "application/json", "{\"status\":\"OK\",\"activeLow\":" + String(activeLow ? "true" : "false") + "}");
+      return;
+    }
+  };
+
+  server.on("/api/relay/polarity", HTTP_ANY, polarityReqHandler, NULL, polarityHandler);
+  server.on("/api/polarity", HTTP_ANY, polarityReqHandler, NULL, polarityHandler);
+
+  // 4. POST /api/relay (Explicit exact match check to prevent subroute interception)
+  server.on("/api/relay", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
+      if (request->url() != "/api/relay") return; // Strictly ignore sub-paths
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
@@ -995,9 +1040,13 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Relay\"}"); });
 
-  // 4. POST /api/switch
-  server.on("/api/switch", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  // 5. POST /api/switch
+  server.on("/api/switch", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
+      if (request->url() != "/api/switch") return;
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
@@ -1011,15 +1060,19 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Switch\"}"); });
 
-  // 5. POST /api/servo/test
+  // 6. POST /api/servo/test
   server.on("/api/servo/test", HTTP_ANY, [](AsyncWebServerRequest *request)
             {
+    if (request->method() == HTTP_OPTIONS) { request->send(200); return; }
     runServoSelfTest();
     request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}"); });
 
-  // 6. POST /api/servo/config
-  server.on("/api/servo/config", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  // 7. POST /api/servo/config
+  server.on("/api/servo/config", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
@@ -1033,19 +1086,6 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Servo Config\"}"); });
 
-  // 7. POST /api/relay/polarity
-  server.on("/api/relay/polarity", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
-            {
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, data, len);
-      if (!error && doc["activeLow"].is<bool>()) {
-        setRelayPolarityAndForceOff(doc["activeLow"].as<bool>());
-        request->send(200, "application/json", "{\"status\":\"OK\"}");
-        return;
-      }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Polarity Payload\"}"); });
-
-  // 8. GET /api/schedules — Return all schedule entries
   server.on("/api/schedules", HTTP_GET, [](AsyncWebServerRequest *request)
             {
     JsonDocument doc;
@@ -1065,14 +1105,15 @@ void setupAPI()
     serializeJson(doc, response);
     request->send(200, "application/json", response); });
 
-  // 9. POST /api/schedules — Save full schedule list
-  server.on("/api/schedules", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  server.on("/api/schedules", HTTP_POST, [](AsyncWebServerRequest *req)
             {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
         JsonArray arr = doc.as<JsonArray>();
-        // Reset all first
         for (int i = 0; i < MAX_SCHEDULES; i++) {
           schedules[i] = ScheduleEntry();
           schedules[i].hour = 0; schedules[i].minute = 0;
@@ -1103,15 +1144,17 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Schedules\"}"); });
 
-  // 10. Timer APIs
-  server.on("/api/timer/add", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  server.on("/api/timer/add", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
         int freeSlot = -1;
         for (int i = 0; i < MAX_TIMERS; i++) {
-          if (!timers[i].active) { freeSlot = i; break; }
+          if (!timers[i].active && !timers[i].finished) { freeSlot = i; break; }
         }
         if (freeSlot != -1) {
           timers[freeSlot].id               = nextTimerId++;
@@ -1119,6 +1162,7 @@ void setupAPI()
           timers[freeSlot].remainingSec     = timers[freeSlot].totalDurationSec;
           timers[freeSlot].paused           = false;
           timers[freeSlot].active           = true;
+          timers[freeSlot].finished         = false;
           timers[freeSlot].invertOnStartEnd = doc["invertOnStartEnd"] | false;
           timers[freeSlot].targetAction     = (doc["targetAction"] == "ON");
 
@@ -1146,18 +1190,38 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Add Timer\"}"); });
 
-  server.on("/api/timer/control", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  server.on("/api/timer/control", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
         int id     = doc["id"] | 0;
         String cmd = doc["command"] | "";
         for (int i = 0; i < MAX_TIMERS; i++) {
-          if (timers[i].active && timers[i].id == id) {
-            if (cmd == "pause")  timers[i].paused = true;
-            else if (cmd == "resume") timers[i].paused = false;
-            else if (cmd == "cancel") timers[i].active = false;
+          if (timers[i].id == id) {
+            if (cmd == "pause") {
+              timers[i].paused = true;
+            } else if (cmd == "resume") {
+              timers[i].paused = false;
+            } else if (cmd == "cancel" || cmd == "stop") {
+              timers[i].active = false;
+              timers[i].paused = false;
+              timers[i].finished = true;
+              timers[i].remainingSec = 0;
+            } else if (cmd == "start" || cmd == "restart") {
+              timers[i].remainingSec = timers[i].totalDurationSec;
+              timers[i].active = true;
+              timers[i].paused = false;
+              timers[i].finished = false;
+              if (timers[i].invertOnStartEnd) {
+                applyTimerTargets(timers[i], !timers[i].targetAction);
+              }
+            } else if (cmd == "remove") {
+              timers[i] = TimerItem();
+            }
             saveTimers();
             request->send(200, "application/json", "{\"status\":\"OK\"}");
             return;
@@ -1166,7 +1230,6 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer not found\"}"); });
 
-  // 11. POST /api/display
   server.on("/api/display", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
             {
       JsonDocument doc;
@@ -1180,7 +1243,6 @@ void setupAPI()
       request->send(200, "application/json",
                     "{\"status\":\"OK\",\"displayPage\":" + String(displayPage) + "}"); });
 
-  // 12. GET /api/hardware/config — Get hardware active state
   server.on("/api/hardware/config", HTTP_GET, [](AsyncWebServerRequest *request)
             {
     JsonDocument doc;
@@ -1192,7 +1254,6 @@ void setupAPI()
     serializeJson(doc, response);
     request->send(200, "application/json", response); });
 
-  // 13. POST /api/hardware/config — Set hardware active/inactive per relay/switch
   server.on("/api/hardware/config", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
             {
       JsonDocument doc;
@@ -1203,7 +1264,6 @@ void setupAPI()
           for (int i = 0; i < NUM_RELAYS && i < (int)rArr.size(); i++) {
             relayActive[i] = rArr[i].as<bool>();
             if (!relayActive[i]) {
-              // Force off disabled relay
               digitalWrite(RELAY_PINS[i], relayOffLevel);
             }
           }
@@ -1220,7 +1280,6 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Hardware Config Payload\"}"); });
 
-  // 14. Reset WiFi
   server.on("/api/wifi/reset", HTTP_ANY, [](AsyncWebServerRequest *request)
             {
     request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Resetting WiFi...\"}");
@@ -1248,7 +1307,7 @@ void setup()
     setRelay(r, false);
   }
 
-  // OLED Init - Safe Detection
+  // OLED Init
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.beginTransmission(0x3C);
   if (Wire.endTransmission() == 0)
@@ -1279,7 +1338,6 @@ void setup()
   loadSchedules();
   loadTimers();
 
-  // Instant WiFi Reset if BOOT button held down during startup
   bool forcePortal = false;
   if (digitalRead(BUTTON_PIN) == LOW)
   {
@@ -1368,6 +1426,9 @@ void setup()
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
 
+  // FIX: Matikan Power Save Mode untuk ping ultra-stabil dan zero packet loss
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   if (oledConnected)
   {
     display.clearDisplay();
@@ -1441,21 +1502,24 @@ void loop()
 
   unsigned long currentMillis = millis();
 
-  // Tick countdown timers every 1000ms
+  // Tick countdown timers setiap 1000ms
   if (currentMillis - lastTimerTick >= 1000)
   {
     lastTimerTick = currentMillis;
     tickTimers();
   }
 
-  // Refresh OLED and check NTP schedules every 1000ms
+  // Refresh OLED dan check NTP schedules secara non-blocking setiap 1000ms
   if (currentMillis - lastOledUpdate >= 1000)
   {
     lastOledUpdate = currentMillis;
 
-    struct tm timeinfo;
-    bool gotTime = getLocalTime(&timeinfo, 0); // 0ms timeout (non-blocking)
-    if (gotTime)
+    // FIX: Menggunakan time_t & localtime() secara non-blocking pengganti getLocalTime()
+    time_t now;
+    time(&now);
+    struct tm *timeinfo = localtime(&now);
+
+    if (timeinfo && timeinfo->tm_year > (1970 - 1900))
     {
       if (!ntpSynced)
       {
@@ -1463,7 +1527,7 @@ void loop()
       }
       else
       {
-        checkSchedules(timeinfo.tm_hour, timeinfo.tm_min);
+        checkSchedules(timeinfo->tm_hour, timeinfo->tm_min);
       }
     }
 
@@ -1472,4 +1536,7 @@ void loop()
       updateOLED();
     }
   }
+
+  // FIX: Mengasih nafas ke FreeRTOS scheduler agar task async_tcp & WiFi tidak kena watchdog reset
+  vTaskDelay(1 / portTICK_PERIOD_MS);
 }
