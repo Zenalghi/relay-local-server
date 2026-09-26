@@ -6,7 +6,6 @@
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <esp_wifi.h> // Tambahan untuk pengatur Power Save WiFi
 #include <WiFiManager.h>
 
@@ -95,6 +94,15 @@ struct ServoAction
 #define MAX_SERVO_ACTIONS 6
 ServoAction servoActions[MAX_SERVO_ACTIONS];
 
+struct ServoRestAlignment
+{
+  bool running = false;
+  uint8_t servo = 0;
+  uint32_t phaseStartMs = 0;
+};
+ServoRestAlignment restAlignment;
+constexpr uint32_t SERVO_REST_ALIGNMENT_MS = 700;
+
 // ---------------------------------------------------------------- Scheduler
 #define MAX_SCHEDULES 10
 
@@ -140,6 +148,7 @@ bool lastButtonState = HIGH;
 unsigned long buttonPressTime = 0;
 bool isHolding = false;
 unsigned long lastOledUpdate = 0;
+bool servoControlReady = false;
 
 void updateOLED();
 void setRelay(int channel, bool state);
@@ -268,9 +277,15 @@ void setRelayPolarityAndForceOff(bool isActiveLow)
 
 void startServoMovement(uint8_t servoIdx, uint8_t targetAngle, uint16_t durationMs)
 {
+  if (!servoControlReady)
+    return;
   if (servoIdx >= NUM_SERVOS)
     return;
-  servos[servoIdx].attach(SERVO_PINS[servoIdx], 500, 2400);
+
+  if (!servos[servoIdx].attached())
+  {
+    servos[servoIdx].attach(SERVO_PINS[servoIdx], 500, 2400);
+  }
   servos[servoIdx].write(targetAngle);
 
   for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
@@ -326,70 +341,93 @@ void triggerSwitch(int switchIdx, bool turnOn)
   switchStates[switchIdx] = turnOn ? 1 : 0;
 }
 
-void applyRestAngleImmediately()
-{
-  for (int s = 0; s < NUM_SERVOS; s++)
-  {
-    servos[s].attach(SERVO_PINS[s], 500, 2400);
-    servos[s].write(restAngle);
-  }
-  delay(300);
-  for (int s = 0; s < NUM_SERVOS; s++)
-  {
-    servos[s].detach();
-  }
-}
-
 struct ServoTestState
 {
   bool running = false;
-  int cycle = 0;
-  int sw = 0;
+  uint8_t servo = 0;
   int phase = 0;
   uint32_t phaseStartMs = 0;
   uint8_t safeAngle = 90;
 };
 ServoTestState selfTest;
 
-void updateServoSelfTest()
+void startServoRestAlignment()
 {
-  if (!selfTest.running)
+  if (!servoControlReady || restAlignment.running || selfTest.running)
+    return;
+
+  for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
+  {
+    if (servoActions[i].active)
+    {
+      servos[servoActions[i].servoIdx].detach();
+      servoActions[i].active = false;
+    }
+  }
+
+  restAlignment.servo = 0;
+  restAlignment.phaseStartMs = 0;
+  restAlignment.running = true;
+  Serial.println("[SERVO] Applying saved rest angle sequentially.");
+}
+
+void updateServoRestAlignment()
+{
+  if (!restAlignment.running)
     return;
 
   uint32_t now = millis();
-  uint8_t onS = selfTest.sw * 2;
-  uint8_t offS = selfTest.sw * 2 + 1;
+  if (restAlignment.phaseStartMs == 0)
+  {
+    servos[restAlignment.servo].attach(
+        SERVO_PINS[restAlignment.servo], 500, 2400);
+    servos[restAlignment.servo].write(restAngle);
+    restAlignment.phaseStartMs = now == 0 ? 1 : now;
+    return;
+  }
 
+  if (now - restAlignment.phaseStartMs < SERVO_REST_ALIGNMENT_MS)
+    return;
+
+  servos[restAlignment.servo].detach();
+  restAlignment.servo++;
+  if (restAlignment.servo >= NUM_SERVOS)
+  {
+    restAlignment.running = false;
+    Serial.println("[SERVO] Saved rest angle applied to all servos.");
+    return;
+  }
+
+  restAlignment.phaseStartMs = 0;
+}
+
+void updateServoSelfTest()
+{
+  if (!selfTest.running || restAlignment.running)
+    return;
+
+  uint32_t now = millis();
   if (selfTest.phase == 0)
   {
-    servos[onS].attach(SERVO_PINS[onS], 500, 2400);
-    servos[offS].attach(SERVO_PINS[offS], 500, 2400);
-    servos[onS].write(selfTest.safeAngle);
-    servos[offS].write(selfTest.safeAngle);
+    servos[selfTest.servo].attach(SERVO_PINS[selfTest.servo], 500, 2400);
+    servos[selfTest.servo].write(selfTest.safeAngle);
     selfTest.phase = 1;
     selfTest.phaseStartMs = now;
   }
-  else if (selfTest.phase == 1 && now - selfTest.phaseStartMs >= 250)
+  else if (selfTest.phase == 1 && now - selfTest.phaseStartMs >= 500)
   {
-    servos[onS].write(restAngle);
-    servos[offS].write(restAngle);
+    servos[selfTest.servo].write(restAngle);
     selfTest.phase = 2;
     selfTest.phaseStartMs = now;
   }
-  else if (selfTest.phase == 2 && now - selfTest.phaseStartMs >= 250)
+  else if (selfTest.phase == 2 && now - selfTest.phaseStartMs >= 500)
   {
-    servos[onS].detach();
-    servos[offS].detach();
-    selfTest.sw++;
-    if (selfTest.sw >= NUM_SWITCHES)
-    {
-      selfTest.sw = 0;
-      selfTest.cycle++;
-    }
-    if (selfTest.cycle >= 3)
+    servos[selfTest.servo].detach();
+    selfTest.servo++;
+    if (selfTest.servo >= NUM_SERVOS)
     {
       selfTest.running = false;
-      Serial.println("[SERVO] SAFE self test sequence complete.");
+      Serial.println("[SERVO] One-shot sequential self test complete.");
     }
     else
     {
@@ -400,9 +438,11 @@ void updateServoSelfTest()
 
 void runServoSelfTest()
 {
-  if (selfTest.running)
+  if (!servoControlReady)
     return;
-  Serial.println("[SERVO] Scheduling SAFE self test sequence (3 cycles)...");
+  if (selfTest.running || restAlignment.running)
+    return;
+  Serial.println("[SERVO] Scheduling one-shot sequential self test...");
   uint8_t safeTestAngle;
   if (pressAngle < restAngle)
   {
@@ -415,8 +455,7 @@ void runServoSelfTest()
     safeTestAngle = (target < 10) ? 10 : (uint8_t)target;
   }
   selfTest.safeAngle = safeTestAngle;
-  selfTest.cycle = 0;
-  selfTest.sw = 0;
+  selfTest.servo = 0;
   selfTest.phase = 0;
   selfTest.phaseStartMs = millis();
   selfTest.running = true;
@@ -534,7 +573,7 @@ void reconcileSchedules(int currentHour, int currentMinute)
       }
     }
     if (switchActive[s])
-      triggerSwitch(s, found ? targetState : false);
+      switchStates[s] = found && targetState ? 1 : 0;
   }
 }
 
@@ -1129,11 +1168,13 @@ void setupAPI()
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
+        uint8_t previousRestAngle = restAngle;
         if (doc["restAngle"].is<uint8_t>())    restAngle      = doc["restAngle"].as<uint8_t>();
         if (doc["pressAngle"].is<uint8_t>())   pressAngle     = doc["pressAngle"].as<uint8_t>();
         if (doc["pressDurationMs"].is<uint16_t>()) pressDurationMs = doc["pressDurationMs"].as<uint16_t>();
         saveServoConfig();
-        applyRestAngleImmediately();
+        if (restAngle != previousRestAngle)
+          startServoRestAlignment();
         request->send(200, "application/json", "{\"status\":\"OK\"}");
         return;
       }
@@ -1390,7 +1431,6 @@ void setup()
 
   loadSchedules();
   loadTimers();
-  // applyRestAngleImmediately();
 
   bool forcePortal = false;
   if (digitalRead(BUTTON_PIN) == LOW)
@@ -1479,6 +1519,7 @@ void setup()
 
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
+  servoControlReady = true;
 
   // FIX: Matikan Power Save Mode untuk ping ultra-stabil dan zero packet loss
   esp_wifi_set_ps(WIFI_PS_NONE);
@@ -1563,7 +1604,6 @@ void setup()
 
 // ---------------------------------------------------------------- LOOP
 unsigned long lastTimerTick = 0;
-unsigned long lastRestAngleRefresh = 0;
 
 void loop()
 {
@@ -1577,6 +1617,7 @@ void loop()
 
   handleButtonPress();
   updateServos();
+  updateServoRestAlignment();
   updateServoSelfTest();
 
   unsigned long currentMillis = millis();
@@ -1613,25 +1654,6 @@ void loop()
     if (!isHolding)
     {
       updateOLED();
-    }
-  }
-
-  // Periodic check every 1 hour (3600000ms): re-pulse servos to rest angle if idle
-  if (currentMillis - lastRestAngleRefresh >= 3600000UL)
-  {
-    lastRestAngleRefresh = currentMillis;
-    bool anyActive = false;
-    for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
-    {
-      if (servoActions[i].active)
-      {
-        anyActive = true;
-        break;
-      }
-    }
-    if (!anyActive && !selfTest.running)
-    {
-      applyRestAngleImmediately();
     }
   }
 
