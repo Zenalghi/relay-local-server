@@ -485,6 +485,59 @@ void saveSchedules()
 
 int getMinutesFromMidnight(int h, int m) { return h * 60 + m; }
 
+void reconcileSchedules(int currentHour, int currentMinute)
+{
+  int currentMin = getMinutesFromMidnight(currentHour, currentMinute);
+  Serial.printf("[SCHED] Reconciling state to clock %02d:%02d (%d min)...\n",
+                currentHour, currentMinute, currentMin);
+
+  // Reconcile each relay independently; an item without a schedule defaults OFF.
+  for (int r = 0; r < NUM_RELAYS; r++)
+  {
+    int bestDiff = 99999;
+    bool targetState = false;
+    bool found = false;
+    for (int i = 0; i < MAX_SCHEDULES; i++)
+    {
+      if (!schedules[i].enabled || !schedules[i].targetRelays[r])
+        continue;
+      int schedMin = getMinutesFromMidnight(schedules[i].hour, schedules[i].minute);
+      int diff = (currentMin - schedMin + 1440) % 1440;
+      if (diff < bestDiff)
+      {
+        bestDiff = diff;
+        targetState = schedules[i].action;
+        found = true;
+      }
+    }
+    if (relayActive[r])
+      setRelay(r + 1, found ? targetState : false);
+  }
+
+  // Reconcile each switch independently; an item without a schedule defaults OFF.
+  for (int s = 0; s < NUM_SWITCHES; s++)
+  {
+    int bestDiff = 99999;
+    bool targetState = false;
+    bool found = false;
+    for (int i = 0; i < MAX_SCHEDULES; i++)
+    {
+      if (!schedules[i].enabled || !schedules[i].targetSwitches[s])
+        continue;
+      int schedMin = getMinutesFromMidnight(schedules[i].hour, schedules[i].minute);
+      int diff = (currentMin - schedMin + 1440) % 1440;
+      if (diff < bestDiff)
+      {
+        bestDiff = diff;
+        targetState = schedules[i].action;
+        found = true;
+      }
+    }
+    if (switchActive[s])
+      triggerSwitch(s, found ? targetState : false);
+  }
+}
+
 void applyChannelAction(bool targetRelays[], bool targetSwitches[], bool action)
 {
   for (int r = 0; r < NUM_RELAYS; r++)
@@ -1337,6 +1390,7 @@ void setup()
 
   loadSchedules();
   loadTimers();
+  // applyRestAngleImmediately();
 
   bool forcePortal = false;
   if (digitalRead(BUTTON_PIN) == LOW)
@@ -1442,6 +1496,30 @@ void setup()
 
   configTime(7 * 3600, 0, "pool.ntp.org");
 
+  struct tm initialTime;
+  const unsigned long ntpWaitStarted = millis();
+  bool initialTimeSynced = false;
+  while (millis() - ntpWaitStarted < 15000UL)
+  {
+    if (getLocalTime(&initialTime, 100) && initialTime.tm_year > (1970 - 1900))
+    {
+      initialTimeSynced = true;
+      break;
+    }
+    delay(100);
+  }
+  if (initialTimeSynced)
+  {
+    ntpSynced = true;
+    reconcileSchedules(initialTime.tm_hour, initialTime.tm_min);
+    lastEvaluatedMinute = getMinutesFromMidnight(initialTime.tm_hour, initialTime.tm_min);
+    Serial.println("[SCHED] Boot reconciliation complete in setup.");
+  }
+  else
+  {
+    Serial.println("[SCHED] NTP unavailable during setup; boot reconciliation skipped.");
+  }
+
   // OTA Setup
   ArduinoOTA.setHostname("r-sync");
   ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1485,6 +1563,7 @@ void setup()
 
 // ---------------------------------------------------------------- LOOP
 unsigned long lastTimerTick = 0;
+unsigned long lastRestAngleRefresh = 0;
 
 void loop()
 {
@@ -1534,6 +1613,25 @@ void loop()
     if (!isHolding)
     {
       updateOLED();
+    }
+  }
+
+  // Periodic check every 1 hour (3600000ms): re-pulse servos to rest angle if idle
+  if (currentMillis - lastRestAngleRefresh >= 3600000UL)
+  {
+    lastRestAngleRefresh = currentMillis;
+    bool anyActive = false;
+    for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
+    {
+      if (servoActions[i].active)
+      {
+        anyActive = true;
+        break;
+      }
+    }
+    if (!anyActive && !selfTest.running)
+    {
+      applyRestAngleImmediately();
     }
   }
 
