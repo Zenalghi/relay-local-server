@@ -107,37 +107,44 @@ uint8_t servoActiveIdx = 0;
 uint16_t servoActiveHoldMs = 0;
 uint32_t servoActiveStartMs = 0;
 
+// All six servos share one 5V rail. A stalling servo pulls several hundred mA,
+// so two of them moving in the same instant dips the rail under the ESP32
+// brownout threshold and the chip resets. This rail gate is the single place
+// where the "one servo at a time" rule is enforced: the move queue, the boot
+// rest alignment pass and the self test all consult it before writing.
+constexpr uint32_t SERVO_SETTLE_MS = 400;
+
+uint32_t servoRailLastWriteMs = 0;
+bool servoRailPrimed = false;
+
+// True when the rail is clear: nothing has been commanded yet, or a full settle
+// time has passed since the last command.
+bool servoRailReady()
+{
+  if (!servoRailPrimed)
+    return true;
+  return (uint32_t)(millis() - servoRailLastWriteMs) >= SERVO_SETTLE_MS;
+}
+
 constexpr uint32_t SERVO_TEST_LEG_MS = 400;
 constexpr uint8_t SERVO_TEST_LOOPS = 2;
 constexpr uint8_t SERVO_TEST_MIN_SWING = 15;
-constexpr uint8_t SERVOS_PER_GROUP = 2;
-static_assert((uint8_t)(SERVOS_PER_GROUP * NUM_SWITCHES) == NUM_SERVOS,
-              "SERVOS_PER_GROUP * NUM_SWITCHES must cover every servo");
-// One PWM frame at 50 Hz, so the servos of a group still read as moving
-// together while the inrush current is spread instead of hitting all six at once.
-constexpr uint32_t SERVO_TEST_STAGGER_MS = 25;
 
 enum ServoTestPhase : uint8_t
 {
   SERVO_TEST_IDLE = 0,
-  SERVO_TEST_OUT = 1,   // restAngle -> mirrorAngle
-  SERVO_TEST_BACK = 2,  // mirrorAngle -> restAngle
-  SERVO_TEST_VERIFY = 3 // re-command restAngle on all servos, then stop
+  SERVO_TEST_OUT = 1,  // restAngle -> mirrorAngle
+  SERVO_TEST_BACK = 2  // mirrorAngle -> restAngle
 };
 
 struct ServoTestState
 {
   bool running = false;
+  bool stepStarted = false;
   uint8_t phase = SERVO_TEST_IDLE;
   uint8_t loopCount = 0;
-  uint8_t group = 0; // 0..NUM_SWITCHES-1, one switch pair of servos per step
-  uint32_t phaseStartMs = 0; // starts once the staggered write burst finishes
-  uint32_t lastWriteMs = 0;
-  uint8_t writeFirst = 0;
-  uint8_t writeCount = 0;
-  uint8_t writeIndex = 0;
-  bool writesDone = false;
-  uint8_t pendingAngle = 90;
+  uint8_t servo = 0; // 0..NUM_SERVOS-1, exactly one servo per step
+  uint32_t phaseStartMs = 0;
   uint8_t mirrorAngle = 90;
 };
 ServoTestState selfTest;
@@ -145,6 +152,7 @@ ServoTestState selfTest;
 struct ServoRestAlignment
 {
   bool running = false;
+  bool stepStarted = false;
   uint8_t servo = 0;
   uint32_t phaseStartMs = 0;
 };
@@ -329,21 +337,31 @@ void setRelayPolarityAndForceOff(bool isActiveLow)
 // esp32-hal-ledc (later attaches fail with "Pin N is already attached to LEDC"),
 // and re-attaching six pins in one burst drags the 5V rail into brownout.
 // No angle is written here: writing restAngle to all six at once would move
-// every servo on the same rail at the same instant. The rest alignment pass
-// that runs right after walks them one at a time.
+// every servo on the same rail at the same instant, and attach() itself can
+// put a live frame on the pin straight away. The rest alignment pass that runs
+// right after walks them one at a time, and the attaches are spaced out so only
+// one servo can be in motion at any moment.
 void attachAllServosOnce()
 {
   for (int i = 0; i < NUM_SERVOS; i++)
   {
     servos[i].attach(SERVO_PINS[i], 500, 2400);
     servoCurrentAngle[i] = SERVO_ANGLE_UNKNOWN;
+    if (i + 1 < NUM_SERVOS)
+      delay(SERVO_SETTLE_MS);
   }
+  // Treat the last attach as a movement command so the rest alignment pass also
+  // waits out the settle time before it touches servo 0.
+  servoRailLastWriteMs = millis();
+  servoRailPrimed = true;
 }
 
 void writeServo(uint8_t servoIdx, uint8_t angle)
 {
   servos[servoIdx].write(angle);
   servoCurrentAngle[servoIdx] = angle;
+  servoRailLastWriteMs = millis();
+  servoRailPrimed = true;
 }
 
 uint8_t servoQueueLength()
@@ -390,6 +408,10 @@ void updateServos()
   {
     if (servoQueueHead == servoQueueTail)
       return;
+    // The previous servo may still be travelling back to rest. Hold the queue
+    // until the rail is clear so the next servo never starts on top of it.
+    if (!servoRailReady())
+      return;
     ServoMoveRequest req = servoQueue[servoQueueHead];
     servoQueueHead = (uint8_t)((servoQueueHead + 1) % SERVO_QUEUE_SIZE);
     servoMoveActive = true;
@@ -406,6 +428,13 @@ void updateServos()
 
   if (!servoMoveReturning)
   {
+    if (!servoRailReady())
+    {
+      // Hold the return back instead of forcing a second servo onto the rail.
+      servoActiveStartMs = now;
+      servoActiveHoldMs = 0;
+      return;
+    }
     writeServo(servoActiveIdx, restAngle);
     servoActiveStartMs = now;
     servoActiveHoldMs = pressDurationMs;
@@ -437,6 +466,7 @@ void startServoRestAlignment()
   abortServoMovement();
 
   restAlignment.servo = 0;
+  restAlignment.stepStarted = false;
   restAlignment.phaseStartMs = 0;
   restAlignment.running = true;
   Serial.println("[SERVO] Applying saved rest angle sequentially.");
@@ -448,10 +478,13 @@ void updateServoRestAlignment()
     return;
 
   uint32_t now = millis();
-  if (restAlignment.phaseStartMs == 0)
+  if (!restAlignment.stepStarted)
   {
+    if (!servoRailReady())
+      return;
     writeServo(restAlignment.servo, restAngle);
-    restAlignment.phaseStartMs = now == 0 ? 1 : now;
+    restAlignment.phaseStartMs = now;
+    restAlignment.stepStarted = true;
     return;
   }
 
@@ -462,11 +495,12 @@ void updateServoRestAlignment()
   if (restAlignment.servo >= NUM_SERVOS)
   {
     restAlignment.running = false;
+    restAlignment.stepStarted = false;
     Serial.println("[SERVO] Saved rest angle applied to all servos.");
     return;
   }
 
-  restAlignment.phaseStartMs = 0;
+  restAlignment.stepStarted = false;
 }
 
 void abortServoMovement()
@@ -482,92 +516,65 @@ void abortServoMovement()
   servoMoveReturning = false;
 }
 
-void beginServoTestStep(uint8_t firstServo, uint8_t count, uint8_t angle, uint8_t nextPhase)
+void beginServoTestStep(uint8_t servoIdx, uint8_t nextPhase)
 {
-  selfTest.writeFirst = firstServo;
-  selfTest.writeCount = count;
-  selfTest.pendingAngle = angle;
+  selfTest.servo = servoIdx;
   selfTest.phase = nextPhase;
-  selfTest.writeIndex = 0;
-  selfTest.writesDone = false;
-  selfTest.lastWriteMs = millis();
-  selfTest.phaseStartMs = millis();
+  selfTest.stepStarted = false;
 }
 
-void beginServoTestGroupStep(uint8_t angle, uint8_t nextPhase)
-{
-  beginServoTestStep(selfTest.group * SERVOS_PER_GROUP, SERVOS_PER_GROUP, angle, nextPhase);
-}
-
-bool servoTestWriteStep(uint32_t now)
-{
-  if (selfTest.writeIndex >= selfTest.writeCount)
-    return true;
-  if (selfTest.writeIndex > 0 && (now - selfTest.lastWriteMs) < SERVO_TEST_STAGGER_MS)
-    return false;
-
-  writeServo(selfTest.writeFirst + selfTest.writeIndex, selfTest.pendingAngle);
-  selfTest.writeIndex++;
-  selfTest.lastWriteMs = now;
-  return selfTest.writeIndex >= selfTest.writeCount;
-}
-
+// Exactly one servo is commanded per leg. Nothing here waits on a second servo,
+// so the rail never carries two stalling motors at once.
 void updateServoSelfTest()
 {
   if (!selfTest.running || restAlignment.running)
     return;
 
   uint32_t now = millis();
-  if (!servoTestWriteStep(now))
-    return;
-  if (!selfTest.writesDone)
+
+  if (!selfTest.stepStarted)
   {
-    selfTest.writesDone = true;
+    if (!servoRailReady())
+      return;
+    writeServo(selfTest.servo, selfTest.phase == SERVO_TEST_OUT ? selfTest.mirrorAngle : restAngle);
     selfTest.phaseStartMs = now;
+    selfTest.stepStarted = true;
     return;
   }
+
+  if (now - selfTest.phaseStartMs < SERVO_TEST_LEG_MS)
+    return;
 
   if (selfTest.phase == SERVO_TEST_OUT)
   {
-    if (now - selfTest.phaseStartMs < SERVO_TEST_LEG_MS)
-      return;
-    beginServoTestGroupStep(restAngle, SERVO_TEST_BACK);
-    Serial.printf("[SERVO] Loop %u/%u group %c: back to rest (%u).\n",
-                  selfTest.loopCount + 1, SERVO_TEST_LOOPS, 'A' + selfTest.group, restAngle);
+    Serial.printf("[SERVO] Loop %u/%u servo %u: back to rest (%u).\n",
+                  selfTest.loopCount + 1, SERVO_TEST_LOOPS, selfTest.servo + 1, restAngle);
+    selfTest.phase = SERVO_TEST_BACK;
+    selfTest.stepStarted = false;
     return;
   }
 
-  if (selfTest.phase == SERVO_TEST_BACK)
+  selfTest.servo++;
+  if (selfTest.servo >= NUM_SERVOS)
   {
-    if (now - selfTest.phaseStartMs < SERVO_TEST_LEG_MS)
-      return;
-    selfTest.group++;
-    if (selfTest.group >= NUM_SWITCHES)
-    {
-      selfTest.group = 0;
-      selfTest.loopCount++;
-    }
-    if (selfTest.loopCount < SERVO_TEST_LOOPS)
-    {
-      beginServoTestGroupStep(selfTest.mirrorAngle, SERVO_TEST_OUT);
-      Serial.printf("[SERVO] Loop %u/%u group %c: out to mirror (%u).\n",
-                    selfTest.loopCount + 1, SERVO_TEST_LOOPS, 'A' + selfTest.group, selfTest.mirrorAngle);
-      return;
-    }
-    beginServoTestStep(0, NUM_SERVOS, restAngle, SERVO_TEST_VERIFY);
+    selfTest.servo = 0;
+    selfTest.loopCount++;
+  }
+  if (selfTest.loopCount < SERVO_TEST_LOOPS)
+  {
+    Serial.printf("[SERVO] Loop %u/%u servo %u: out to mirror (%u).\n",
+                  selfTest.loopCount + 1, SERVO_TEST_LOOPS, selfTest.servo + 1, selfTest.mirrorAngle);
+    selfTest.phase = SERVO_TEST_OUT;
+    selfTest.stepStarted = false;
     return;
   }
 
-  if (selfTest.phase == SERVO_TEST_VERIFY)
-  {
-    if (now - selfTest.phaseStartMs < SERVO_REST_ALIGNMENT_MS)
-      return;
-    selfTest.running = false;
-    selfTest.phase = SERVO_TEST_IDLE;
-    selfTest.loopCount = 0;
-    selfTest.group = 0;
-    Serial.println("[SERVO] Self test complete, all servos held at rest angle.");
-  }
+  // Every leg ended by writing restAngle, so nothing has to be re-commanded.
+  selfTest.running = false;
+  selfTest.phase = SERVO_TEST_IDLE;
+  selfTest.stepStarted = false;
+  selfTest.loopCount = 0;
+  Serial.println("[SERVO] Self test complete, all servos held at rest angle.");
 }
 
 void runServoSelfTest()
@@ -594,12 +601,11 @@ void runServoSelfTest()
 
   selfTest.mirrorAngle = (uint8_t)mirror;
   selfTest.loopCount = 0;
-  selfTest.group = 0;
   selfTest.running = true;
-  beginServoTestGroupStep((uint8_t)mirror, SERVO_TEST_OUT);
+  beginServoTestStep(0, SERVO_TEST_OUT);
 
-  Serial.printf("[SERVO] Self test: rest %u -> mirror %u -> rest, %u servos per switch, %u loops.\n",
-                restAngle, selfTest.mirrorAngle, SERVOS_PER_GROUP, SERVO_TEST_LOOPS);
+  Serial.printf("[SERVO] Self test: rest %u -> mirror %u -> rest, 1 servo at a time, %u loops.\n",
+                restAngle, selfTest.mirrorAngle, SERVO_TEST_LOOPS);
 }
 
 // ---------------------------------------------------------------- Scheduler Load/Save
