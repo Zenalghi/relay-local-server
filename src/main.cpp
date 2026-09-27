@@ -81,18 +81,66 @@ uint16_t pressDurationMs = 400;
 
 int switchStates[NUM_SWITCHES] = {0, 0, 0};
 
-struct ServoAction
+// Last angle commanded to each servo, so a request that would not move the
+// servo is dropped instead of queued.
+#define SERVO_ANGLE_UNKNOWN 255
+uint8_t servoCurrentAngle[NUM_SERVOS];
+
+// Servo movements are executed strictly one at a time. Several servos on the
+// same 5V rail moving at the same instant drags the rail into brownout, so the
+// app, the scheduler and the timers all funnel into this queue.
+struct ServoMoveRequest
 {
   uint8_t servoIdx;
   uint8_t targetAngle;
-  uint32_t startTimeMs;
-  uint32_t durationMs;
-  bool active;
-  bool returningToRest;
+  uint16_t holdMs;
 };
 
-#define MAX_SERVO_ACTIONS 6
-ServoAction servoActions[MAX_SERVO_ACTIONS];
+#define SERVO_QUEUE_SIZE 12
+ServoMoveRequest servoQueue[SERVO_QUEUE_SIZE];
+uint8_t servoQueueHead = 0;
+uint8_t servoQueueTail = 0;
+
+bool servoMoveActive = false;
+bool servoMoveReturning = false;
+uint8_t servoActiveIdx = 0;
+uint16_t servoActiveHoldMs = 0;
+uint32_t servoActiveStartMs = 0;
+
+constexpr uint32_t SERVO_TEST_LEG_MS = 400;
+constexpr uint8_t SERVO_TEST_LOOPS = 2;
+constexpr uint8_t SERVO_TEST_MIN_SWING = 15;
+constexpr uint8_t SERVOS_PER_GROUP = 2;
+static_assert((uint8_t)(SERVOS_PER_GROUP * NUM_SWITCHES) == NUM_SERVOS,
+              "SERVOS_PER_GROUP * NUM_SWITCHES must cover every servo");
+// One PWM frame at 50 Hz, so the servos of a group still read as moving
+// together while the inrush current is spread instead of hitting all six at once.
+constexpr uint32_t SERVO_TEST_STAGGER_MS = 25;
+
+enum ServoTestPhase : uint8_t
+{
+  SERVO_TEST_IDLE = 0,
+  SERVO_TEST_OUT = 1,   // restAngle -> mirrorAngle
+  SERVO_TEST_BACK = 2,  // mirrorAngle -> restAngle
+  SERVO_TEST_VERIFY = 3 // re-command restAngle on all servos, then stop
+};
+
+struct ServoTestState
+{
+  bool running = false;
+  uint8_t phase = SERVO_TEST_IDLE;
+  uint8_t loopCount = 0;
+  uint8_t group = 0; // 0..NUM_SWITCHES-1, one switch pair of servos per step
+  uint32_t phaseStartMs = 0; // starts once the staggered write burst finishes
+  uint32_t lastWriteMs = 0;
+  uint8_t writeFirst = 0;
+  uint8_t writeCount = 0;
+  uint8_t writeIndex = 0;
+  bool writesDone = false;
+  uint8_t pendingAngle = 90;
+  uint8_t mirrorAngle = 90;
+};
+ServoTestState selfTest;
 
 struct ServoRestAlignment
 {
@@ -155,6 +203,7 @@ void setRelay(int channel, bool state);
 bool getRelay(int channel);
 void triggerSwitch(int switchIdx, bool turnOn);
 void runServoSelfTest();
+void abortServoMovement();
 
 volatile bool servoTestRequested = false;
 
@@ -275,63 +324,102 @@ void setRelayPolarityAndForceOff(bool isActiveLow)
   savePolarity();
 }
 
+// Every servo is attached exactly once at boot and never detached again.
+// Repeated attach/detach corrupts the LEDC pin/channel bookkeeping in
+// esp32-hal-ledc (later attaches fail with "Pin N is already attached to LEDC"),
+// and re-attaching six pins in one burst drags the 5V rail into brownout.
+// No angle is written here: writing restAngle to all six at once would move
+// every servo on the same rail at the same instant. The rest alignment pass
+// that runs right after walks them one at a time.
+void attachAllServosOnce()
+{
+  for (int i = 0; i < NUM_SERVOS; i++)
+  {
+    servos[i].attach(SERVO_PINS[i], 500, 2400);
+    servoCurrentAngle[i] = SERVO_ANGLE_UNKNOWN;
+  }
+}
+
+void writeServo(uint8_t servoIdx, uint8_t angle)
+{
+  servos[servoIdx].write(angle);
+  servoCurrentAngle[servoIdx] = angle;
+}
+
+uint8_t servoQueueLength()
+{
+  return (uint8_t)((servoQueueTail - servoQueueHead + SERVO_QUEUE_SIZE) % SERVO_QUEUE_SIZE);
+}
+
+void clearServoQueue()
+{
+  servoQueueHead = servoQueueTail = 0;
+}
+
+bool requestServoMove(uint8_t servoIdx, uint8_t targetAngle, uint16_t holdMs)
+{
+  if (!servoControlReady || servoIdx >= NUM_SERVOS)
+    return false;
+  if (selfTest.running || restAlignment.running)
+    return false;
+  if (servoCurrentAngle[servoIdx] == targetAngle)
+    return false;
+  if (servoQueueLength() >= SERVO_QUEUE_SIZE)
+  {
+    Serial.printf("[SERVO] Queue full, dropped move for servo %u.\n", servoIdx);
+    return false;
+  }
+
+  servoQueue[servoQueueTail].servoIdx = servoIdx;
+  servoQueue[servoQueueTail].targetAngle = targetAngle;
+  servoQueue[servoQueueTail].holdMs = holdMs ? holdMs : pressDurationMs;
+  servoQueueTail = (uint8_t)((servoQueueTail + 1) % SERVO_QUEUE_SIZE);
+  return true;
+}
+
 void startServoMovement(uint8_t servoIdx, uint8_t targetAngle, uint16_t durationMs)
 {
-  if (!servoControlReady)
-    return;
-  if (servoIdx >= NUM_SERVOS)
-    return;
-
-  if (!servos[servoIdx].attached())
-  {
-    servos[servoIdx].attach(SERVO_PINS[servoIdx], 500, 2400);
-  }
-  servos[servoIdx].write(targetAngle);
-
-  for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
-  {
-    if (!servoActions[i].active || servoActions[i].servoIdx == servoIdx)
-    {
-      servoActions[i].servoIdx = servoIdx;
-      servoActions[i].targetAngle = targetAngle;
-      servoActions[i].startTimeMs = millis();
-      servoActions[i].durationMs = durationMs;
-      servoActions[i].active = true;
-      servoActions[i].returningToRest = false;
-      break;
-    }
-  }
+  requestServoMove(servoIdx, targetAngle, durationMs);
 }
 
 void updateServos()
 {
   uint32_t now = millis();
-  for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
+
+  if (!servoMoveActive)
   {
-    if (servoActions[i].active)
-    {
-      if (now - servoActions[i].startTimeMs >= servoActions[i].durationMs)
-      {
-        uint8_t idx = servoActions[i].servoIdx;
-        if (!servoActions[i].returningToRest)
-        {
-          servos[idx].write(restAngle);
-          servoActions[i].startTimeMs = now;
-          servoActions[i].durationMs = pressDurationMs;
-          servoActions[i].returningToRest = true;
-        }
-        else
-        {
-          servos[idx].detach();
-          servoActions[i].active = false;
-        }
-      }
-    }
+    if (servoQueueHead == servoQueueTail)
+      return;
+    ServoMoveRequest req = servoQueue[servoQueueHead];
+    servoQueueHead = (uint8_t)((servoQueueHead + 1) % SERVO_QUEUE_SIZE);
+    servoMoveActive = true;
+    servoMoveReturning = false;
+    servoActiveIdx = req.servoIdx;
+    servoActiveHoldMs = req.holdMs;
+    servoActiveStartMs = now;
+    writeServo(servoActiveIdx, req.targetAngle);
+    return;
   }
+
+  if (now - servoActiveStartMs < servoActiveHoldMs)
+    return;
+
+  if (!servoMoveReturning)
+  {
+    writeServo(servoActiveIdx, restAngle);
+    servoActiveStartMs = now;
+    servoActiveHoldMs = pressDurationMs;
+    servoMoveReturning = true;
+    return;
+  }
+
+  servoMoveActive = false;
 }
 
 void triggerSwitch(int switchIdx, bool turnOn)
 {
+  if (selfTest.running)
+    return;
   if (switchIdx < 0 || switchIdx >= NUM_SWITCHES)
     return;
   if (!switchActive[switchIdx])
@@ -341,29 +429,12 @@ void triggerSwitch(int switchIdx, bool turnOn)
   switchStates[switchIdx] = turnOn ? 1 : 0;
 }
 
-struct ServoTestState
-{
-  bool running = false;
-  uint8_t servo = 0;
-  int phase = 0;
-  uint32_t phaseStartMs = 0;
-  uint8_t safeAngle = 90;
-};
-ServoTestState selfTest;
-
 void startServoRestAlignment()
 {
   if (!servoControlReady || restAlignment.running || selfTest.running)
     return;
 
-  for (int i = 0; i < MAX_SERVO_ACTIONS; i++)
-  {
-    if (servoActions[i].active)
-    {
-      servos[servoActions[i].servoIdx].detach();
-      servoActions[i].active = false;
-    }
-  }
+  abortServoMovement();
 
   restAlignment.servo = 0;
   restAlignment.phaseStartMs = 0;
@@ -379,9 +450,7 @@ void updateServoRestAlignment()
   uint32_t now = millis();
   if (restAlignment.phaseStartMs == 0)
   {
-    servos[restAlignment.servo].attach(
-        SERVO_PINS[restAlignment.servo], 500, 2400);
-    servos[restAlignment.servo].write(restAngle);
+    writeServo(restAlignment.servo, restAngle);
     restAlignment.phaseStartMs = now == 0 ? 1 : now;
     return;
   }
@@ -389,7 +458,6 @@ void updateServoRestAlignment()
   if (now - restAlignment.phaseStartMs < SERVO_REST_ALIGNMENT_MS)
     return;
 
-  servos[restAlignment.servo].detach();
   restAlignment.servo++;
   if (restAlignment.servo >= NUM_SERVOS)
   {
@@ -401,38 +469,104 @@ void updateServoRestAlignment()
   restAlignment.phaseStartMs = 0;
 }
 
+void abortServoMovement()
+{
+  clearServoQueue();
+  if (servoMoveActive && !servoMoveReturning)
+  {
+    // Park the servo that was mid-press at the rest angle instead of leaving
+    // it stuck at the press angle.
+    writeServo(servoActiveIdx, restAngle);
+  }
+  servoMoveActive = false;
+  servoMoveReturning = false;
+}
+
+void beginServoTestStep(uint8_t firstServo, uint8_t count, uint8_t angle, uint8_t nextPhase)
+{
+  selfTest.writeFirst = firstServo;
+  selfTest.writeCount = count;
+  selfTest.pendingAngle = angle;
+  selfTest.phase = nextPhase;
+  selfTest.writeIndex = 0;
+  selfTest.writesDone = false;
+  selfTest.lastWriteMs = millis();
+  selfTest.phaseStartMs = millis();
+}
+
+void beginServoTestGroupStep(uint8_t angle, uint8_t nextPhase)
+{
+  beginServoTestStep(selfTest.group * SERVOS_PER_GROUP, SERVOS_PER_GROUP, angle, nextPhase);
+}
+
+bool servoTestWriteStep(uint32_t now)
+{
+  if (selfTest.writeIndex >= selfTest.writeCount)
+    return true;
+  if (selfTest.writeIndex > 0 && (now - selfTest.lastWriteMs) < SERVO_TEST_STAGGER_MS)
+    return false;
+
+  writeServo(selfTest.writeFirst + selfTest.writeIndex, selfTest.pendingAngle);
+  selfTest.writeIndex++;
+  selfTest.lastWriteMs = now;
+  return selfTest.writeIndex >= selfTest.writeCount;
+}
+
 void updateServoSelfTest()
 {
   if (!selfTest.running || restAlignment.running)
     return;
 
   uint32_t now = millis();
-  if (selfTest.phase == 0)
+  if (!servoTestWriteStep(now))
+    return;
+  if (!selfTest.writesDone)
   {
-    servos[selfTest.servo].attach(SERVO_PINS[selfTest.servo], 500, 2400);
-    servos[selfTest.servo].write(selfTest.safeAngle);
-    selfTest.phase = 1;
+    selfTest.writesDone = true;
     selfTest.phaseStartMs = now;
+    return;
   }
-  else if (selfTest.phase == 1 && now - selfTest.phaseStartMs >= 500)
+
+  if (selfTest.phase == SERVO_TEST_OUT)
   {
-    servos[selfTest.servo].write(restAngle);
-    selfTest.phase = 2;
-    selfTest.phaseStartMs = now;
+    if (now - selfTest.phaseStartMs < SERVO_TEST_LEG_MS)
+      return;
+    beginServoTestGroupStep(restAngle, SERVO_TEST_BACK);
+    Serial.printf("[SERVO] Loop %u/%u group %c: back to rest (%u).\n",
+                  selfTest.loopCount + 1, SERVO_TEST_LOOPS, 'A' + selfTest.group, restAngle);
+    return;
   }
-  else if (selfTest.phase == 2 && now - selfTest.phaseStartMs >= 500)
+
+  if (selfTest.phase == SERVO_TEST_BACK)
   {
-    servos[selfTest.servo].detach();
-    selfTest.servo++;
-    if (selfTest.servo >= NUM_SERVOS)
+    if (now - selfTest.phaseStartMs < SERVO_TEST_LEG_MS)
+      return;
+    selfTest.group++;
+    if (selfTest.group >= NUM_SWITCHES)
     {
-      selfTest.running = false;
-      Serial.println("[SERVO] One-shot sequential self test complete.");
+      selfTest.group = 0;
+      selfTest.loopCount++;
     }
-    else
+    if (selfTest.loopCount < SERVO_TEST_LOOPS)
     {
-      selfTest.phase = 0;
+      beginServoTestGroupStep(selfTest.mirrorAngle, SERVO_TEST_OUT);
+      Serial.printf("[SERVO] Loop %u/%u group %c: out to mirror (%u).\n",
+                    selfTest.loopCount + 1, SERVO_TEST_LOOPS, 'A' + selfTest.group, selfTest.mirrorAngle);
+      return;
     }
+    beginServoTestStep(0, NUM_SERVOS, restAngle, SERVO_TEST_VERIFY);
+    return;
+  }
+
+  if (selfTest.phase == SERVO_TEST_VERIFY)
+  {
+    if (now - selfTest.phaseStartMs < SERVO_REST_ALIGNMENT_MS)
+      return;
+    selfTest.running = false;
+    selfTest.phase = SERVO_TEST_IDLE;
+    selfTest.loopCount = 0;
+    selfTest.group = 0;
+    Serial.println("[SERVO] Self test complete, all servos held at rest angle.");
   }
 }
 
@@ -442,23 +576,30 @@ void runServoSelfTest()
     return;
   if (selfTest.running || restAlignment.running)
     return;
-  Serial.println("[SERVO] Scheduling one-shot sequential self test...");
-  uint8_t safeTestAngle;
-  if (pressAngle < restAngle)
+
+  int mirror = 180 - (int)pressAngle;
+  if (mirror < 10)
+    mirror = 10;
+  if (mirror > 170)
+    mirror = 170;
+
+  if (abs(mirror - (int)restAngle) < (int)SERVO_TEST_MIN_SWING)
   {
-    int target = (int)restAngle + 35;
-    safeTestAngle = (target > 170) ? 170 : (uint8_t)target;
+    int up = (int)restAngle + (int)SERVO_TEST_MIN_SWING;
+    int down = (int)restAngle - (int)SERVO_TEST_MIN_SWING;
+    mirror = (up <= 170) ? up : ((down >= 10) ? down : (int)restAngle);
   }
-  else
-  {
-    int target = (int)restAngle - 35;
-    safeTestAngle = (target < 10) ? 10 : (uint8_t)target;
-  }
-  selfTest.safeAngle = safeTestAngle;
-  selfTest.servo = 0;
-  selfTest.phase = 0;
-  selfTest.phaseStartMs = millis();
+
+  abortServoMovement();
+
+  selfTest.mirrorAngle = (uint8_t)mirror;
+  selfTest.loopCount = 0;
+  selfTest.group = 0;
   selfTest.running = true;
+  beginServoTestGroupStep((uint8_t)mirror, SERVO_TEST_OUT);
+
+  Serial.printf("[SERVO] Self test: rest %u -> mirror %u -> rest, %u servos per switch, %u loops.\n",
+                restAngle, selfTest.mirrorAngle, SERVOS_PER_GROUP, SERVO_TEST_LOOPS);
 }
 
 // ---------------------------------------------------------------- Scheduler Load/Save
@@ -1004,6 +1145,13 @@ void setupAPI()
     doc["pressAngle"]     = pressAngle;
     doc["pressDurationMs"] = pressDurationMs;
 
+    JsonArray servoAngleArr = doc["servoAngles"].to<JsonArray>();
+    for (int s = 0; s < NUM_SERVOS; s++) {
+      servoAngleArr.add(servoCurrentAngle[s] == SERVO_ANGLE_UNKNOWN ? -1 : servoCurrentAngle[s]);
+    }
+    doc["servoQueueLength"] = servoQueueLength();
+    doc["servoBusy"] = servoMoveActive || selfTest.running || restAlignment.running;
+
     JsonArray rArr = doc["relays"].to<JsonArray>();
     for (int r = 1; r <= NUM_RELAYS; r++) {
       rArr.add(getRelay(r) ? "ON" : "OFF");
@@ -1156,6 +1304,10 @@ void setupAPI()
   server.on("/api/servo/test", HTTP_ANY, [](AsyncWebServerRequest *request)
             {
     if (request->method() == HTTP_OPTIONS) { request->send(200); return; }
+    if (selfTest.running) {
+      request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test already running\"}");
+      return;
+    }
     runServoSelfTest();
     request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}"); });
 
@@ -1520,6 +1672,11 @@ void setup()
   Serial.println("WiFi connected");
   WiFi.setAutoReconnect(true);
   servoControlReady = true;
+
+  // Attach every servo once, then never detach again. Rest alignment walks
+  // them one at a time so boot does not move six servos on the same rail.
+  attachAllServosOnce();
+  startServoRestAlignment();
 
   // FIX: Matikan Power Save Mode untuk ping ultra-stabil dan zero packet loss
   esp_wifi_set_ps(WIFI_PS_NONE);
