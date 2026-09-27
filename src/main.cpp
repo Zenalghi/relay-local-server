@@ -129,7 +129,7 @@ bool servoRailPrimed = false;
 // undersized supply: with the divider the numbers say which one it is, without
 // it a brownout looks identical in both cases. Set the pin to -1 to disable.
 #ifndef SERVO_RAIL_ADC_PIN
-#define SERVO_RAIL_ADC_PIN 34
+#define SERVO_RAIL_ADC_PIN -1
 #endif
 #define SERVO_RAIL_DIVIDER_RATIO 2.0f
 
@@ -177,8 +177,8 @@ constexpr uint8_t SERVO_TEST_MIN_SWING = 15;
 enum ServoTestPhase : uint8_t
 {
   SERVO_TEST_IDLE = 0,
-  SERVO_TEST_OUT = 1,  // restAngle -> mirrorAngle
-  SERVO_TEST_BACK = 2  // mirrorAngle -> restAngle
+  SERVO_TEST_OUT = 1, // restAngle -> mirrorAngle
+  SERVO_TEST_BACK = 2 // mirrorAngle -> restAngle
 };
 
 struct ServoTestState
@@ -249,6 +249,7 @@ unsigned long buttonPressTime = 0;
 bool isHolding = false;
 unsigned long lastOledUpdate = 0;
 bool servoControlReady = false;
+bool servoAttached[NUM_SERVOS] = {false, false, false, false, false, false};
 
 void updateOLED();
 void setRelay(int channel, bool state);
@@ -387,19 +388,26 @@ void setRelayPolarityAndForceOff(bool isActiveLow)
 // one servo can be in motion at any moment.
 void attachAllServosOnce()
 {
-  // Alokasi timer PWM untuk ESP32Servo agar tidak bentrok channel LEDC
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-
+  bool allAttached = true;
   for (int i = 0; i < NUM_SERVOS; i++)
   {
-    servos[i].setPeriodHertz(50); // Standard 50Hz servo
+    servos[i].setPeriodHertz(50);
     servos[i].attach(SERVO_PINS[i], 500, 2400);
+    servoAttached[i] = servos[i].attached();
+    if (!servoAttached[i])
+    {
+      allAttached = false;
+      Serial.printf("[SERVO] ERROR: attach failed for servo %u on GPIO %u.\n", i + 1, SERVO_PINS[i]);
+    }
     servoCurrentAngle[i] = SERVO_ANGLE_UNKNOWN;
     if (i + 1 < NUM_SERVOS)
       delay(SERVO_SETTLE_MS);
+  }
+  if (!allAttached)
+  {
+    servoControlReady = false;
+    Serial.println("[SERVO] Servo control disabled because one or more PWM channels failed to attach.");
+    return;
   }
   // Treat the last attach as a movement command so the rest alignment pass also
   // waits out the settle time before it touches servo 0.
@@ -409,6 +417,8 @@ void attachAllServosOnce()
 
 void writeServo(uint8_t servoIdx, uint8_t angle)
 {
+  if (servoIdx >= NUM_SERVOS || !servoAttached[servoIdx])
+    return;
   // The rail reading goes out before the command, and millis() goes out with
   // it, so the last line printed before a reset names the exact servo and the
   // exact time the rail collapsed.
@@ -545,6 +555,9 @@ void updateServoRestAlignment()
   }
 
   if (now - restAlignment.phaseStartMs < SERVO_REST_ALIGNMENT_MS)
+    return;
+
+  if (!servoRailReady())
     return;
 
   restAlignment.servo++;
