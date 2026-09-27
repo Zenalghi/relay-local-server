@@ -655,10 +655,14 @@ void reconcileSchedules(int currentHour, int currentMinute)
       }
     }
     if (relayActive[r])
-      setRelay(r + 1, found ? targetState : false);
+    {
+      bool state = found ? targetState : false;
+      Serial.printf("[SCHED] Relay %d reconciled -> %s\n", r + 1, state ? "ON" : "OFF");
+      setRelay(r + 1, state);
+    }
   }
 
-  // Reconcile each switch independently; an item without a schedule defaults OFF.
+  // Reconcile each switch independently; if schedule found, trigger corresponding servo via queue
   for (int s = 0; s < NUM_SWITCHES; s++)
   {
     int bestDiff = 99999;
@@ -677,8 +681,12 @@ void reconcileSchedules(int currentHour, int currentMinute)
         found = true;
       }
     }
-    if (switchActive[s])
-      switchStates[s] = found && targetState ? 1 : 0;
+    if (switchActive[s] && found)
+    {
+      Serial.printf("[SCHED] Switch %c reconciled -> %s (triggering servo via queue)\n",
+                    'A' + s, targetState ? "ON" : "OFF");
+      triggerSwitch(s, targetState);
+    }
   }
 }
 
@@ -1650,7 +1658,8 @@ void setup()
     display.display();
   }
 
-  configTime(7 * 3600, 0, "pool.ntp.org");
+  Serial.println("[NTP] Configuring time with NTP servers...");
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
 
   struct tm initialTime;
   const unsigned long ntpWaitStarted = millis();
@@ -1667,13 +1676,16 @@ void setup()
   if (initialTimeSynced)
   {
     ntpSynced = true;
+    Serial.printf("[SCHED] Boot NTP sync success: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  initialTime.tm_year + 1900, initialTime.tm_mon + 1, initialTime.tm_mday,
+                  initialTime.tm_hour, initialTime.tm_min, initialTime.tm_sec);
     reconcileSchedules(initialTime.tm_hour, initialTime.tm_min);
     lastEvaluatedMinute = getMinutesFromMidnight(initialTime.tm_hour, initialTime.tm_min);
     Serial.println("[SCHED] Boot reconciliation complete in setup.");
   }
   else
   {
-    Serial.println("[SCHED] NTP unavailable during setup; boot reconciliation skipped.");
+    Serial.println("[SCHED] NTP unavailable during setup; boot reconciliation will run in loop when NTP syncs.");
   }
 
   // OTA Setup
@@ -1758,6 +1770,11 @@ void loop()
       if (!ntpSynced)
       {
         ntpSynced = true;
+        Serial.printf("[SCHED] First NTP sync in loop: %04d-%02d-%02d %02d:%02d:%02d. Running reconcile...\n",
+                      timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                      timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        reconcileSchedules(timeinfo->tm_hour, timeinfo->tm_min);
+        lastEvaluatedMinute = getMinutesFromMidnight(timeinfo->tm_hour, timeinfo->tm_min);
       }
       else
       {
