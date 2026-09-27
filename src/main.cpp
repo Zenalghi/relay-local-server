@@ -1046,6 +1046,161 @@ void handleButtonPress()
   lastButtonState = currentButtonState;
 }
 
+// ---------------------------------------------------------------- Unified Timer Processor
+void processTimerRequest(JsonDocument &doc, AsyncWebServerRequest *request)
+{
+  String action = doc["action"] | doc["command"] | "";
+  if (action == "")
+  {
+    if (doc["durationSec"].is<int>() && !doc["id"].is<int>())
+    {
+      action = "add";
+    }
+  }
+
+  if (action == "add" || action == "create")
+  {
+    int freeSlot = -1;
+    for (int i = 0; i < MAX_TIMERS; i++)
+    {
+      if (!timers[i].active && !timers[i].finished)
+      {
+        freeSlot = i;
+        break;
+      }
+    }
+    if (freeSlot != -1)
+    {
+      timers[freeSlot].id               = nextTimerId++;
+      timers[freeSlot].totalDurationSec = doc["durationSec"] | 0;
+      timers[freeSlot].remainingSec     = timers[freeSlot].totalDurationSec;
+      timers[freeSlot].paused           = false;
+      timers[freeSlot].active           = true;
+      timers[freeSlot].finished         = false;
+      timers[freeSlot].invertOnStartEnd = doc["invertOnStartEnd"] | false;
+      timers[freeSlot].targetAction     = (doc["targetAction"] == "ON");
+
+      JsonArray rArr = doc["targetRelays"].as<JsonArray>();
+      for (int r = 0; r < NUM_RELAYS; r++)
+      {
+        timers[freeSlot].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
+      }
+      JsonArray sArr = doc["targetSwitches"].as<JsonArray>();
+      for (int s = 0; s < NUM_SWITCHES; s++)
+      {
+        timers[freeSlot].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
+      }
+
+      if (timers[freeSlot].invertOnStartEnd)
+      {
+        applyTimerTargets(timers[freeSlot], !timers[freeSlot].targetAction);
+      }
+
+      saveTimers();
+      request->send(200, "application/json",
+                    "{\"status\":\"OK\",\"id\":" + String(timers[freeSlot].id) + "}");
+      return;
+    }
+    else
+    {
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer slots full\"}");
+      return;
+    }
+  }
+
+  // ID-based operations: update/edit, delete/remove, pause, resume, cancel/stop, start/restart
+  int id = doc["id"] | 0;
+  for (int i = 0; i < MAX_TIMERS; i++)
+  {
+    if (timers[i].id == id)
+    {
+      if (action == "update" || action == "edit")
+      {
+        uint32_t dur = doc["durationSec"] | timers[i].totalDurationSec;
+        timers[i].totalDurationSec = dur;
+        timers[i].remainingSec = dur;
+        timers[i].paused = false;
+        timers[i].active = true;
+        timers[i].finished = false;
+        if (doc["invertOnStartEnd"].is<bool>())
+        {
+          timers[i].invertOnStartEnd = doc["invertOnStartEnd"].as<bool>();
+        }
+        if (doc["targetAction"].is<const char *>())
+        {
+          timers[i].targetAction = (doc["targetAction"] == "ON");
+        }
+        if (doc["targetRelays"].is<JsonArray>())
+        {
+          JsonArray rArr = doc["targetRelays"].as<JsonArray>();
+          for (int r = 0; r < NUM_RELAYS; r++)
+          {
+            timers[i].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
+          }
+        }
+        if (doc["targetSwitches"].is<JsonArray>())
+        {
+          JsonArray sArr = doc["targetSwitches"].as<JsonArray>();
+          for (int s = 0; s < NUM_SWITCHES; s++)
+          {
+            timers[i].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
+          }
+        }
+        if (timers[i].invertOnStartEnd)
+        {
+          applyTimerTargets(timers[i], !timers[i].targetAction);
+        }
+        saveTimers();
+        request->send(200, "application/json", "{\"status\":\"OK\",\"id\":" + String(id) + "}");
+        return;
+      }
+      else if (action == "delete" || action == "remove")
+      {
+        timers[i] = TimerItem();
+        saveTimers();
+        request->send(200, "application/json", "{\"status\":\"OK\"}");
+        return;
+      }
+      else if (action == "pause")
+      {
+        timers[i].paused = true;
+      }
+      else if (action == "resume")
+      {
+        timers[i].paused = false;
+      }
+      else if (action == "cancel" || action == "stop")
+      {
+        timers[i].active = false;
+        timers[i].paused = false;
+        timers[i].finished = true;
+        timers[i].remainingSec = 0;
+      }
+      else if (action == "start" || action == "restart")
+      {
+        timers[i].remainingSec = timers[i].totalDurationSec;
+        timers[i].active = true;
+        timers[i].paused = false;
+        timers[i].finished = false;
+        if (timers[i].invertOnStartEnd)
+        {
+          applyTimerTargets(timers[i], !timers[i].targetAction);
+        }
+      }
+      else
+      {
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Unknown action\"}");
+        return;
+      }
+      saveTimers();
+      request->send(200, "application/json", "{\"status\":\"OK\"}");
+      return;
+    }
+  }
+
+  request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer not found\"}");
+}
+
 // ---------------------------------------------------------------- REST API Endpoints
 void setupAPI()
 {
@@ -1360,6 +1515,21 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Schedules\"}"); });
 
+  // 1. Unified endpoint: POST /api/timer
+  server.on("/api/timer", HTTP_ANY, [](AsyncWebServerRequest *req)
+            {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, data, len);
+      if (!error) {
+        processTimerRequest(doc, request);
+      } else {
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload\"}");
+      } });
+
+  // 2. Legacy alias: POST /api/timer/add
   server.on("/api/timer/add", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
     if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
@@ -1368,44 +1538,28 @@ void setupAPI()
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        int freeSlot = -1;
-        for (int i = 0; i < MAX_TIMERS; i++) {
-          if (!timers[i].active && !timers[i].finished) { freeSlot = i; break; }
-        }
-        if (freeSlot != -1) {
-          timers[freeSlot].id               = nextTimerId++;
-          timers[freeSlot].totalDurationSec = doc["durationSec"] | 0;
-          timers[freeSlot].remainingSec     = timers[freeSlot].totalDurationSec;
-          timers[freeSlot].paused           = false;
-          timers[freeSlot].active           = true;
-          timers[freeSlot].finished         = false;
-          timers[freeSlot].invertOnStartEnd = doc["invertOnStartEnd"] | false;
-          timers[freeSlot].targetAction     = (doc["targetAction"] == "ON");
+        if (!doc["action"].is<const char *>()) doc["action"] = "add";
+        processTimerRequest(doc, request);
+      } else {
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Add Timer\"}");
+      } });
 
-          JsonArray rArr = doc["targetRelays"].as<JsonArray>();
-          for (int r = 0; r < NUM_RELAYS; r++) {
-            timers[freeSlot].targetRelays[r] = (r < (int)rArr.size()) ? rArr[r].as<bool>() : false;
-          }
-          JsonArray sArr = doc["targetSwitches"].as<JsonArray>();
-          for (int s = 0; s < NUM_SWITCHES; s++) {
-            timers[freeSlot].targetSwitches[s] = (s < (int)sArr.size()) ? sArr[s].as<bool>() : false;
-          }
+  // 3. Legacy alias: POST /api/timer/update
+  server.on("/api/timer/update", HTTP_ANY, [](AsyncWebServerRequest *req)
+            {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, data, len);
+      if (!error) {
+        if (!doc["action"].is<const char *>()) doc["action"] = "update";
+        processTimerRequest(doc, request);
+      } else {
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Update Timer\"}");
+      } });
 
-          if (timers[freeSlot].invertOnStartEnd) {
-            applyTimerTargets(timers[freeSlot], !timers[freeSlot].targetAction);
-          }
-
-          saveTimers();
-          request->send(200, "application/json",
-                        "{\"status\":\"OK\",\"id\":" + String(timers[freeSlot].id) + "}");
-          return;
-        } else {
-          request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer slots full\"}");
-          return;
-        }
-      }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Add Timer\"}"); });
-
+  // 4. Legacy alias: POST /api/timer/control
   server.on("/api/timer/control", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
     if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
@@ -1414,37 +1568,10 @@ void setupAPI()
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        int id     = doc["id"] | 0;
-        String cmd = doc["command"] | "";
-        for (int i = 0; i < MAX_TIMERS; i++) {
-          if (timers[i].id == id) {
-            if (cmd == "pause") {
-              timers[i].paused = true;
-            } else if (cmd == "resume") {
-              timers[i].paused = false;
-            } else if (cmd == "cancel" || cmd == "stop") {
-              timers[i].active = false;
-              timers[i].paused = false;
-              timers[i].finished = true;
-              timers[i].remainingSec = 0;
-            } else if (cmd == "start" || cmd == "restart") {
-              timers[i].remainingSec = timers[i].totalDurationSec;
-              timers[i].active = true;
-              timers[i].paused = false;
-              timers[i].finished = false;
-              if (timers[i].invertOnStartEnd) {
-                applyTimerTargets(timers[i], !timers[i].targetAction);
-              }
-            } else if (cmd == "remove") {
-              timers[i] = TimerItem();
-            }
-            saveTimers();
-            request->send(200, "application/json", "{\"status\":\"OK\"}");
-            return;
-          }
-        }
-      }
-      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Timer not found\"}"); });
+        processTimerRequest(doc, request);
+      } else {
+        request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Control Timer\"}");
+      } });
 
   server.on("/api/display", HTTP_ANY, [](AsyncWebServerRequest *req) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
             {
@@ -1510,17 +1637,15 @@ void setup()
 {
   Serial.begin(115200);
 
-  for (int r = 0; r < NUM_RELAYS; r++)
-  {
-    pinMode(RELAY_PINS[r], OUTPUT);
-  }
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   loadPolarity();
   loadHardwareConfig();
-  for (int r = 1; r <= NUM_RELAYS; r++)
+
+  for (int r = 0; r < NUM_RELAYS; r++)
   {
-    setRelay(r, false);
+    digitalWrite(RELAY_PINS[r], relayOffLevel);
+    pinMode(RELAY_PINS[r], OUTPUT);
   }
 
   // OLED Init
