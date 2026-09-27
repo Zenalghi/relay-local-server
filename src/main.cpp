@@ -2,11 +2,11 @@
  * @file main.cpp
  * @brief R-Sync ESP32 Local Server Firmware (Combined 4 Relays + 6 Servos + Timers + Scheduler)
  * @author Zenalghi
- * @version 3.0.0
+ * @version 3.0.1
  */
 
 #include <Arduino.h>
-#include <esp_wifi.h> // Tambahan untuk pengatur Power Save WiFi
+#include <esp_wifi.h>
 #include <WiFiManager.h>
 
 // WiFiManager includes WebServer.h which uses http_parser sequential enums (0,1,2,3...).
@@ -112,10 +112,52 @@ uint32_t servoActiveStartMs = 0;
 // brownout threshold and the chip resets. This rail gate is the single place
 // where the "one servo at a time" rule is enforced: the move queue, the boot
 // rest alignment pass and the self test all consult it before writing.
-constexpr uint32_t SERVO_SETTLE_MS = 400;
+//
+// 400 ms was not enough on every servo: a 90 degree travel takes roughly 450 ms
+// on an MG996R/MG90S, so the next servo used to start while the previous one was
+// still turning. 800 ms covers the slow servos as well.
+#ifndef SERVO_SETTLE_MS
+#define SERVO_SETTLE_MS 800
+#endif
 
 uint32_t servoRailLastWriteMs = 0;
 bool servoRailPrimed = false;
+
+// ---------------------------------------------------------------- Servo Rail Monitor
+// Wire a 100k/100k divider from the servo 5V rail to this pin. Sampling the rail
+// around every servo command is the only way to tell a firmware overlap from an
+// undersized supply: with the divider the numbers say which one it is, without
+// it a brownout looks identical in both cases. Set the pin to -1 to disable.
+#ifndef SERVO_RAIL_ADC_PIN
+#define SERVO_RAIL_ADC_PIN 34
+#endif
+#define SERVO_RAIL_DIVIDER_RATIO 2.0f
+
+uint16_t servoRailMv = 0;
+uint16_t servoRailMinMv = 0;
+
+void servoRailMonitorInit()
+{
+#if SERVO_RAIL_ADC_PIN >= 0
+  pinMode(SERVO_RAIL_ADC_PIN, INPUT);
+  analogSetPinAttenuation(SERVO_RAIL_ADC_PIN, ADC_11db);
+#endif
+}
+
+// Returns the rail voltage in mV and keeps the lowest reading of the run, which
+// is the number that matters: the ESP32 browns out at roughly 3.0 V on 3.3 V.
+uint16_t servoRailReadMv()
+{
+#if SERVO_RAIL_ADC_PIN >= 0
+  uint16_t mv = (uint16_t)(analogReadMilliVolts(SERVO_RAIL_ADC_PIN) * SERVO_RAIL_DIVIDER_RATIO);
+  servoRailMv = mv;
+  if (servoRailMinMv == 0 || mv < servoRailMinMv)
+    servoRailMinMv = mv;
+  return mv;
+#else
+  return 0;
+#endif
+}
 
 // True when the rail is clear: nothing has been commanded yet, or a full settle
 // time has passed since the last command.
@@ -127,7 +169,9 @@ bool servoRailReady()
 }
 
 constexpr uint32_t SERVO_TEST_LEG_MS = 400;
-constexpr uint8_t SERVO_TEST_LOOPS = 2;
+#ifndef SERVO_TEST_LOOPS
+#define SERVO_TEST_LOOPS 2
+#endif
 constexpr uint8_t SERVO_TEST_MIN_SWING = 15;
 
 enum ServoTestPhase : uint8_t
@@ -343,8 +387,15 @@ void setRelayPolarityAndForceOff(bool isActiveLow)
 // one servo can be in motion at any moment.
 void attachAllServosOnce()
 {
+  // Alokasi timer PWM untuk ESP32Servo agar tidak bentrok channel LEDC
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
   for (int i = 0; i < NUM_SERVOS; i++)
   {
+    servos[i].setPeriodHertz(50); // Standard 50Hz servo
     servos[i].attach(SERVO_PINS[i], 500, 2400);
     servoCurrentAngle[i] = SERVO_ANGLE_UNKNOWN;
     if (i + 1 < NUM_SERVOS)
@@ -358,6 +409,11 @@ void attachAllServosOnce()
 
 void writeServo(uint8_t servoIdx, uint8_t angle)
 {
+  // The rail reading goes out before the command, and millis() goes out with
+  // it, so the last line printed before a reset names the exact servo and the
+  // exact time the rail collapsed.
+  Serial.printf("[SERVO] t=%lu rail=%umV (min %umV) -> servo %u = %u\n",
+                millis(), servoRailReadMv(), servoRailMinMv, servoIdx + 1, angle);
   servos[servoIdx].write(angle);
   servoCurrentAngle[servoIdx] = angle;
   servoRailLastWriteMs = millis();
@@ -574,7 +630,8 @@ void updateServoSelfTest()
   selfTest.phase = SERVO_TEST_IDLE;
   selfTest.stepStarted = false;
   selfTest.loopCount = 0;
-  Serial.println("[SERVO] Self test complete, all servos held at rest angle.");
+  Serial.printf("[SERVO] Self test complete, lowest rail reading %umV over %u commands.\n",
+                servoRailMinMv, (unsigned)SERVO_TEST_LOOPS * NUM_SERVOS * 2);
 }
 
 void runServoSelfTest()
@@ -604,6 +661,7 @@ void runServoSelfTest()
   selfTest.running = true;
   beginServoTestStep(0, SERVO_TEST_OUT);
 
+  servoRailMinMv = 0;
   Serial.printf("[SERVO] Self test: rest %u -> mirror %u -> rest, 1 servo at a time, %u loops.\n",
                 restAngle, selfTest.mirrorAngle, SERVO_TEST_LOOPS);
 }
@@ -1157,6 +1215,8 @@ void setupAPI()
     }
     doc["servoQueueLength"] = servoQueueLength();
     doc["servoBusy"] = servoMoveActive || selfTest.running || restAlignment.running;
+    doc["servoRailMv"] = servoRailMv;
+    doc["servoRailMinMv"] = servoRailMinMv;
 
     JsonArray rArr = doc["relays"].to<JsonArray>();
     for (int r = 1; r <= NUM_RELAYS; r++) {
@@ -1317,7 +1377,6 @@ void setupAPI()
     runServoSelfTest();
     request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}"); });
 
-  // 7. POST /api/servo/config
   server.on("/api/servo/config", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
     if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
@@ -1679,12 +1738,10 @@ void setup()
   WiFi.setAutoReconnect(true);
   servoControlReady = true;
 
-  // Attach every servo once, then never detach again. Rest alignment walks
-  // them one at a time so boot does not move six servos on the same rail.
+  servoRailMonitorInit();
   attachAllServosOnce();
   startServoRestAlignment();
 
-  // FIX: Matikan Power Save Mode untuk ping ultra-stabil dan zero packet loss
   esp_wifi_set_ps(WIFI_PS_NONE);
 
   if (oledConnected)
