@@ -77,6 +77,7 @@ int displayPage = 0; // 0: Status, 1: Sched, 2: Timers
 Servo servos[NUM_SERVOS];
 uint8_t restAngle = 90;
 uint8_t pressAngle = 0;
+uint8_t pressAngles[NUM_SERVOS] = {0, 0, 0, 0, 0, 0};
 uint16_t pressDurationMs = 400;
 
 int switchStates[NUM_SWITCHES] = {0, 0, 0};
@@ -167,9 +168,11 @@ constexpr uint8_t SERVO_TEST_MIN_SWING = 15;
 enum ServoTestPhase : uint8_t
 {
   SERVO_TEST_IDLE = 0,
-  SERVO_TEST_OUT = 1,  // attach & move to mirrorAngle
-  SERVO_TEST_BACK = 2, // move to restAngle
-  SERVO_TEST_DONE = 3  // detach & advance to next servo
+  SERVO_TEST_INIT_REST = 1, // attach & move to restAngle first
+  SERVO_TEST_TARGET1 = 2,   // move to target1 (0° or press-10)
+  SERVO_TEST_TARGET2 = 3,   // move to target2 (press-10 or 0°)
+  SERVO_TEST_RETURN = 4,    // move back to restAngle
+  SERVO_TEST_DONE = 5       // detach & advance to next servo
 };
 
 struct ServoTestState
@@ -178,8 +181,8 @@ struct ServoTestState
   uint8_t phase = SERVO_TEST_IDLE;
   uint8_t loopCount = 0;
   uint8_t servo = 0; // 0..NUM_SERVOS-1, strictly one servo per step
+  int8_t singleServo = -1; // -1: all servos sequentially, >=0: single servo mode
   uint32_t phaseStartMs = 0;
-  uint8_t mirrorAngle = 90;
 };
 ServoTestState selfTest;
 
@@ -234,7 +237,7 @@ void updateOLED();
 void setRelay(int channel, bool state);
 bool getRelay(int channel);
 void triggerSwitch(int switchIdx, bool turnOn);
-void runServoSelfTest();
+void runServoSelfTest(int singleServo = -1);
 void abortServoMovement();
 
 volatile bool servoTestRequested = false;
@@ -263,6 +266,11 @@ void loadPolarity()
   restAngle = preferences.getUChar("restAngle", 90);
   pressAngle = preferences.getUChar("pressAngle", 0);
   pressDurationMs = preferences.getUShort("pressDur", 400);
+  for (int i = 0; i < NUM_SERVOS; i++)
+  {
+    String key = "pa" + String(i);
+    pressAngles[i] = preferences.getUChar(key.c_str(), pressAngle);
+  }
   preferences.end();
   applyPolarity(stored);
 }
@@ -280,6 +288,11 @@ void saveServoConfig()
   preferences.putUChar("restAngle", restAngle);
   preferences.putUChar("pressAngle", pressAngle);
   preferences.putUShort("pressDur", pressDurationMs);
+  for (int i = 0; i < NUM_SERVOS; i++)
+  {
+    String key = "pa" + String(i);
+    preferences.putUChar(key.c_str(), pressAngles[i]);
+  }
   preferences.end();
 }
 
@@ -458,13 +471,25 @@ void triggerSwitch(int switchIdx, bool turnOn)
   if (!switchActive[switchIdx])
     return;
   uint8_t servoIdx = (switchIdx * 2) + (turnOn ? 0 : 1);
-  startServoMovement(servoIdx, pressAngle, pressDurationMs);
+  startServoMovement(servoIdx, pressAngles[servoIdx], pressDurationMs);
   switchStates[switchIdx] = turnOn ? 1 : 0;
 }
 
 void abortServoMovement()
 {
   clearServoQueue();
+  if (selfTest.running)
+  {
+    if (servos[selfTest.servo].attached())
+    {
+      servos[selfTest.servo].write(restAngle);
+      delay(150);
+      servos[selfTest.servo].detach();
+    }
+    servoCurrentAngle[selfTest.servo] = SERVO_ANGLE_UNKNOWN;
+    selfTest.running = false;
+    selfTest.phase = SERVO_TEST_IDLE;
+  }
   if (servoMoveActive)
   {
     if (servos[servoActiveIdx].attached())
@@ -479,7 +504,21 @@ void abortServoMovement()
   servoMoveReturning = false;
 }
 
-// Exactly one servo is tested at a time with attach -> mirror -> rest -> detach
+uint8_t getServoPressOffset(uint8_t s)
+{
+  if (s >= NUM_SERVOS)
+    return 0;
+  int p = (int)pressAngles[s] - 10;
+  if (p < 0)
+    p = 0;
+  if (p > 180)
+    p = 180;
+  return (uint8_t)p;
+}
+
+// Exactly one servo is tested at a time with non-blocking steps:
+// restAngle <= 90: restAngle -> 0° -> (pressAngle - 10°) -> restAngle
+// restAngle > 90:  restAngle -> (pressAngle - 10°) -> 0° -> restAngle
 void updateServoSelfTest()
 {
   if (!selfTest.running)
@@ -487,12 +526,16 @@ void updateServoSelfTest()
 
   uint32_t now = millis();
 
-  if (selfTest.phase == SERVO_TEST_OUT)
+  uint8_t angleOffset = getServoPressOffset(selfTest.servo);
+  uint8_t target1 = (restAngle <= 90) ? 0 : angleOffset;
+  uint8_t target2 = (restAngle <= 90) ? angleOffset : 0;
+
+  if (selfTest.phase == SERVO_TEST_INIT_REST)
   {
     if (!servoRailReady())
       return;
-    writeServo(selfTest.servo, selfTest.mirrorAngle);
-    selfTest.phase = SERVO_TEST_BACK;
+    writeServo(selfTest.servo, restAngle);
+    selfTest.phase = SERVO_TEST_TARGET1;
     selfTest.phaseStartMs = now;
     return;
   }
@@ -500,7 +543,23 @@ void updateServoSelfTest()
   if (now - selfTest.phaseStartMs < SERVO_TEST_LEG_MS)
     return;
 
-  if (selfTest.phase == SERVO_TEST_BACK)
+  if (selfTest.phase == SERVO_TEST_TARGET1)
+  {
+    writeServo(selfTest.servo, target1);
+    selfTest.phase = SERVO_TEST_TARGET2;
+    selfTest.phaseStartMs = now;
+    return;
+  }
+
+  if (selfTest.phase == SERVO_TEST_TARGET2)
+  {
+    writeServo(selfTest.servo, target2);
+    selfTest.phase = SERVO_TEST_RETURN;
+    selfTest.phaseStartMs = now;
+    return;
+  }
+
+  if (selfTest.phase == SERVO_TEST_RETURN)
   {
     writeServo(selfTest.servo, restAngle);
     selfTest.phase = SERVO_TEST_DONE;
@@ -516,6 +575,14 @@ void updateServoSelfTest()
     Serial.printf("[SERVO] Self-test loop %u/%u servo %u complete & detached.\n",
                   selfTest.loopCount + 1, SERVO_TEST_LOOPS, selfTest.servo + 1);
 
+    if (selfTest.singleServo >= 0)
+    {
+      selfTest.running = false;
+      selfTest.phase = SERVO_TEST_IDLE;
+      Serial.printf("[SERVO] Single servo %d test complete.\n", selfTest.singleServo + 1);
+      return;
+    }
+
     selfTest.servo++;
     if (selfTest.servo >= NUM_SERVOS)
     {
@@ -524,7 +591,8 @@ void updateServoSelfTest()
     }
     if (selfTest.loopCount < SERVO_TEST_LOOPS)
     {
-      selfTest.phase = SERVO_TEST_OUT;
+      selfTest.phase = SERVO_TEST_INIT_REST;
+      selfTest.phaseStartMs = now;
     }
     else
     {
@@ -535,35 +603,42 @@ void updateServoSelfTest()
   }
 }
 
-void runServoSelfTest()
+void runServoSelfTest(int singleServo)
 {
   if (!servoControlReady || selfTest.running)
     return;
 
-  int mirror = 180 - (int)pressAngle;
-  if (mirror < 10)
-    mirror = 10;
-  if (mirror > 170)
-    mirror = 170;
-
-  if (abs(mirror - (int)restAngle) < (int)SERVO_TEST_MIN_SWING)
-  {
-    int up = (int)restAngle + (int)SERVO_TEST_MIN_SWING;
-    int down = (int)restAngle - (int)SERVO_TEST_MIN_SWING;
-    mirror = (up <= 170) ? up : ((down >= 10) ? down : (int)restAngle);
-  }
-
   abortServoMovement();
 
-  selfTest.mirrorAngle = (uint8_t)mirror;
   selfTest.loopCount = 0;
-  selfTest.servo = 0;
-  selfTest.phase = SERVO_TEST_OUT;
+  if (singleServo >= 0 && singleServo < NUM_SERVOS)
+  {
+    selfTest.singleServo = (int8_t)singleServo;
+    selfTest.servo = (uint8_t)singleServo;
+  }
+  else
+  {
+    selfTest.singleServo = -1;
+    selfTest.servo = 0;
+  }
+
+  selfTest.phase = SERVO_TEST_INIT_REST;
   selfTest.phaseStartMs = millis();
   selfTest.running = true;
 
-  Serial.printf("[SERVO] Self test: rest %u -> mirror %u -> rest, 1 servo at a time with detach, %u loops.\n",
-                restAngle, selfTest.mirrorAngle, SERVO_TEST_LOOPS);
+  if (selfTest.singleServo >= 0)
+  {
+    Serial.printf("[SERVO] Single test servo %u: rest %u -> %s -> rest\n",
+                  selfTest.servo + 1, restAngle,
+                  (restAngle <= 90) ? "0 -> (press-10)" : "(press-10) -> 0");
+  }
+  else
+  {
+    Serial.printf("[SERVO] Self test: rest %u -> %s -> rest, 1 servo at a time, %u loops.\n",
+                  restAngle,
+                  (restAngle <= 90) ? "0 -> (press-10)" : "(press-10) -> 0",
+                  SERVO_TEST_LOOPS);
+  }
 }
 
 // ---------------------------------------------------------------- Scheduler Load/Save
@@ -1272,6 +1347,11 @@ void setupAPI()
     doc["pressAngle"]     = pressAngle;
     doc["pressDurationMs"] = pressDurationMs;
 
+    JsonArray pressAngleArr = doc["pressAngles"].to<JsonArray>();
+    for (int s = 0; s < NUM_SERVOS; s++) {
+      pressAngleArr.add(pressAngles[s]);
+    }
+
     JsonArray servoAngleArr = doc["servoAngles"].to<JsonArray>();
     for (int s = 0; s < NUM_SERVOS; s++) {
       servoAngleArr.add(servoCurrentAngle[s] == SERVO_ANGLE_UNKNOWN ? -1 : servoCurrentAngle[s]);
@@ -1429,16 +1509,45 @@ void setupAPI()
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Switch\"}"); });
 
-  // 6. POST /api/servo/test
-  server.on("/api/servo/test", HTTP_ANY, [](AsyncWebServerRequest *request)
-            {
-    if (request->method() == HTTP_OPTIONS) { request->send(200); return; }
+  // 6. POST /api/servo/test (supports testing all or individual servo via {"servo": 0..5} or ?servo=0..5)
+  auto servoTestHandler = [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+  {
+    if (request->method() == HTTP_OPTIONS) return;
     if (selfTest.running) {
       request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test already running\"}");
       return;
     }
-    runServoSelfTest();
-    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}"); });
+    int targetServo = -1;
+    if (len > 0) {
+      JsonDocument doc;
+      if (!deserializeJson(doc, data, len)) {
+        if (doc["servo"].is<int>()) targetServo = doc["servo"].as<int>();
+      }
+    }
+    if (request->hasParam("servo")) {
+      targetServo = request->getParam("servo")->value().toInt();
+    }
+    runServoSelfTest(targetServo);
+    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}");
+  };
+
+  auto servoTestReqHandler = [](AsyncWebServerRequest *request)
+  {
+    if (request->method() == HTTP_OPTIONS) { request->send(200); return; }
+    if (request->contentLength() > 0) return;
+    if (selfTest.running) {
+      request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test already running\"}");
+      return;
+    }
+    int targetServo = -1;
+    if (request->hasParam("servo")) {
+      targetServo = request->getParam("servo")->value().toInt();
+    }
+    runServoSelfTest(targetServo);
+    request->send(200, "application/json", "{\"status\":\"OK\",\"message\":\"Self test scheduled\"}");
+  };
+
+  server.on("/api/servo/test", HTTP_ANY, servoTestReqHandler, NULL, servoTestHandler);
 
   server.on("/api/servo/config", HTTP_ANY, [](AsyncWebServerRequest *req)
             {
@@ -1449,7 +1558,18 @@ void setupAPI()
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
         if (doc["restAngle"].is<uint8_t>())    restAngle      = doc["restAngle"].as<uint8_t>();
-        if (doc["pressAngle"].is<uint8_t>())   pressAngle     = doc["pressAngle"].as<uint8_t>();
+        if (doc["pressAngle"].is<uint8_t>()) {
+          pressAngle = doc["pressAngle"].as<uint8_t>();
+          if (!doc["pressAngles"].is<JsonArray>()) {
+            for (int s = 0; s < NUM_SERVOS; s++) pressAngles[s] = pressAngle;
+          }
+        }
+        if (doc["pressAngles"].is<JsonArray>()) {
+          JsonArray paArr = doc["pressAngles"].as<JsonArray>();
+          for (int s = 0; s < NUM_SERVOS && s < (int)paArr.size(); s++) {
+            pressAngles[s] = (uint8_t)constrain((int)paArr[s].as<int>(), 0, 180);
+          }
+        }
         if (doc["pressDurationMs"].is<uint16_t>()) pressDurationMs = doc["pressDurationMs"].as<uint16_t>();
         saveServoConfig();
         request->send(200, "application/json", "{\"status\":\"OK\"}");

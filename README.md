@@ -90,10 +90,24 @@ Mengontrol relay 1..4. Payload: `{"channel": 1, "state": "ON"}`.
 Mengontrol saklar tembok A..C (index 0=A, 1=B, 2=C). Payload: `{"switch": 0, "state": "ON"}`.
 
 ### 5. `POST /api/servo/test`
-Memicu gerakan uji coba 3x untuk seluruh servo.
+Memicu gerakan uji coba mandiri non-blocking (self-test).
+- Tanpa payload/param: Menjalankan uji coba seluruh 6 servo secara berurutan.
+- Dengan payload: `{"servo": 0}` (atau query `?servo=0`) untuk menguji satu servo spesifik (0..5).
+- Pola pergerakan aman:
+  - `restAngle <= 90°`: `restAngle` -> `0°` -> `(pressAngle - 10°)` -> `restAngle`
+  - `restAngle > 90°`: `restAngle` -> `(pressAngle - 10°)` -> `0°` -> `restAngle`
 
 ### 6. `POST /api/servo/config`
-Mengalibrasi sudut servo. Payload: `{"restAngle": 90, "pressAngle": 0, "pressDurationMs": 400}`.
+Mengalibrasi sudut servo baik global maupun independen per-servo.
+Payload:
+```json
+{
+  "restAngle": 90,
+  "pressAngle": 0,
+  "pressAngles": [0, 5, 0, 10, 0, 5],
+  "pressDurationMs": 400
+}
+```
 
 ### 7. `POST /api/timer/add`
 Menambahkan timer countdown baru. Payload:
