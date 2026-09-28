@@ -186,6 +186,15 @@ struct ServoTestState
 };
 ServoTestState selfTest;
 
+struct ServoAlignState
+{
+  bool running = false;
+  uint8_t servo = 0;
+  bool moving = false;
+  uint32_t startMs = 0;
+};
+ServoAlignState servoAlign;
+
 // ---------------------------------------------------------------- Scheduler
 #define MAX_SCHEDULES 10
 
@@ -238,6 +247,8 @@ void setRelay(int channel, bool state);
 bool getRelay(int channel);
 void triggerSwitch(int switchIdx, bool turnOn);
 void runServoSelfTest(int singleServo = -1);
+void alignAllServosToRest();
+void updateServoAlign();
 void abortServoMovement();
 
 volatile bool servoTestRequested = false;
@@ -399,7 +410,7 @@ bool requestServoMove(uint8_t servoIdx, uint8_t targetAngle, uint16_t holdMs)
 {
   if (!servoControlReady || servoIdx >= NUM_SERVOS)
     return false;
-  if (selfTest.running)
+  if (selfTest.running || servoAlign.running)
     return false;
   if (servoQueueLength() >= SERVO_QUEUE_SIZE)
   {
@@ -464,7 +475,7 @@ void updateServos()
 
 void triggerSwitch(int switchIdx, bool turnOn)
 {
-  if (selfTest.running)
+  if (selfTest.running || servoAlign.running)
     return;
   if (switchIdx < 0 || switchIdx >= NUM_SWITCHES)
     return;
@@ -478,6 +489,18 @@ void triggerSwitch(int switchIdx, bool turnOn)
 void abortServoMovement()
 {
   clearServoQueue();
+  if (servoAlign.running)
+  {
+    if (servos[servoAlign.servo].attached())
+    {
+      servos[servoAlign.servo].write(restAngle);
+      delay(150);
+      servos[servoAlign.servo].detach();
+    }
+    servoCurrentAngle[servoAlign.servo] = SERVO_ANGLE_UNKNOWN;
+    servoAlign.running = false;
+    servoAlign.moving = false;
+  }
   if (selfTest.running)
   {
     if (servos[selfTest.servo].attached())
@@ -638,6 +661,58 @@ void runServoSelfTest(int singleServo)
                   restAngle,
                   (restAngle <= 90) ? "0 -> (press-10)" : "(press-10) -> 0",
                   SERVO_TEST_LOOPS);
+  }
+}
+
+void alignAllServosToRest()
+{
+  if (!servoControlReady)
+    return;
+
+  abortServoMovement();
+
+  servoAlign.running = true;
+  servoAlign.servo = 0;
+  servoAlign.moving = false;
+  servoAlign.startMs = 0;
+
+  Serial.printf("[SERVO] Aligning all servos to restAngle %u, 1 by 1 with detach.\n", restAngle);
+}
+
+void updateServoAlign()
+{
+  if (!servoAlign.running)
+    return;
+
+  uint32_t now = millis();
+
+  if (!servoAlign.moving)
+  {
+    if (!servoRailReady())
+      return;
+    writeServo(servoAlign.servo, restAngle);
+    servoAlign.moving = true;
+    servoAlign.startMs = now;
+    return;
+  }
+
+  if (now - servoAlign.startMs < SERVO_TEST_LEG_MS)
+    return;
+
+  // Servo reached restAngle, detach immediately to release holding torque
+  servos[servoAlign.servo].detach();
+  servoCurrentAngle[servoAlign.servo] = SERVO_ANGLE_UNKNOWN;
+  servoRailLastWriteMs = now;
+  servoAlign.moving = false;
+
+  Serial.printf("[SERVO] Aligned servo %u to restAngle %u & detached.\n",
+                servoAlign.servo + 1, restAngle);
+
+  servoAlign.servo++;
+  if (servoAlign.servo >= NUM_SERVOS)
+  {
+    servoAlign.running = false;
+    Serial.println("[SERVO] All servos aligned to restAngle and detached.");
   }
 }
 
@@ -1357,7 +1432,7 @@ void setupAPI()
       servoAngleArr.add(servoCurrentAngle[s] == SERVO_ANGLE_UNKNOWN ? -1 : servoCurrentAngle[s]);
     }
     doc["servoQueueLength"] = servoQueueLength();
-    doc["servoBusy"] = servoMoveActive || selfTest.running;
+    doc["servoBusy"] = servoMoveActive || selfTest.running || servoAlign.running;
     doc["servoRailMv"] = servoRailMv;
     doc["servoRailMinMv"] = servoRailMinMv;
 
@@ -1557,7 +1632,10 @@ void setupAPI()
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
       if (!error) {
-        if (doc["restAngle"].is<uint8_t>())    restAngle      = doc["restAngle"].as<uint8_t>();
+        if (doc["restAngle"].is<uint8_t>()) {
+          restAngle = doc["restAngle"].as<uint8_t>();
+          alignAllServosToRest();
+        }
         if (doc["pressAngle"].is<uint8_t>()) {
           pressAngle = doc["pressAngle"].as<uint8_t>();
           if (!doc["pressAngles"].is<JsonArray>()) {
@@ -1990,6 +2068,7 @@ void loop()
   handleButtonPress();
   updateServos();
   updateServoSelfTest();
+  updateServoAlign();
 
   unsigned long currentMillis = millis();
 
