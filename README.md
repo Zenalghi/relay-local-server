@@ -4,6 +4,7 @@ Dokumentasi resmi firmware controller gabungan **4 Relay + 6 Servo (3 Wall Switc
 
 - **Repositori Firmware ESP32**: [https://github.com/Zenalghi/relay-local-server](https://github.com/Zenalghi/relay-local-server)
 - **Repositori Aplikasi Flutter**: [https://github.com/Zenalghi/r_sync_app](https://github.com/Zenalghi/r_sync_app)
+- **Dokumentasi AI / Local LLM Tool Calling**: [API_TOOL_CALLING.md](file:///c:/Nova/relay-local-server/API_TOOL_CALLING.md)
 
 ---
 
