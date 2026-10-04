@@ -38,6 +38,9 @@
 #include <ESP32Servo.h>
 #include <time.h>
 #include <ArduinoOTA.h>
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
+#include <ir_Gree.h>
 
 #ifndef OTA_PASSWORD
 #define OTA_PASSWORD "change-me"
@@ -58,6 +61,7 @@ const uint8_t SERVO_PINS[NUM_SERVOS] = {14, 27, 26, 25, 33, 32};
 // ---------------------------------------------------------------- Hardware Active Flags
 bool relayActive[NUM_RELAYS] = {true, true, true, true};
 bool switchActive[NUM_SWITCHES] = {true, true, true};
+bool acActive = true;
 
 // ---------------------------------------------------------------- Relay Polarity
 bool activeLow = true;
@@ -71,7 +75,26 @@ uint8_t relayOffLevel = HIGH;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledConnected = false;
 volatile bool ota_updating = false;
-int displayPage = 0; // 0: Status, 1: Sched, 2: Timers
+int displayPage = 0; // 0: Status, 1: Sched, 2: Timers, 3: AC
+
+// ---------------------------------------------------------------- AC Remote
+#define IR_LED_PIN 18
+IRGreeAC ac(IR_LED_PIN);
+
+struct AcState {
+  bool power = false;
+  uint8_t temp = 24;
+  uint8_t mode = 0; 
+  uint8_t fan = 0;
+  bool swing_v = true;
+  bool sleep = false;
+  bool turbo = false;
+  bool xfan = false;
+  bool light = true;
+  bool ifeel = false;
+  uint8_t displayTemp = 1;
+};
+AcState acState;
 
 // ---------------------------------------------------------------- Servos & Calibration
 Servo servos[NUM_SERVOS];
@@ -204,6 +227,7 @@ struct ScheduleEntry
   uint8_t minute;
   bool action;
   bool enabled;
+  int targetAc; // 0 = ignore, 1 = ON, 2 = OFF
   bool targetRelays[NUM_RELAYS];
   bool targetSwitches[NUM_SWITCHES];
 };
@@ -225,6 +249,7 @@ struct TimerItem
   bool finished; // Completed timers are kept & persisted as history
   bool invertOnStartEnd;
   bool targetAction;
+  int targetAc; // 0 = ignore, 1 = ON, 2 = OFF
   bool targetRelays[NUM_RELAYS];
   bool targetSwitches[NUM_SWITCHES];
 };
@@ -321,6 +346,7 @@ void loadHardwareConfig()
     String key = "s" + String(i);
     switchActive[i] = preferences.getBool(key.c_str(), true);
   }
+  acActive = preferences.getBool("ac", true);
   preferences.end();
 }
 
@@ -337,6 +363,51 @@ void saveHardwareConfig()
     String key = "s" + String(i);
     preferences.putBool(key.c_str(), switchActive[i]);
   }
+  preferences.putBool("ac", acActive);
+  preferences.end();
+}
+
+void loadAcState() {
+  preferences.begin("ac_state", true);
+  acState.power = preferences.getBool("power", false);
+  acState.temp = preferences.getUChar("temp", 24);
+  acState.mode = preferences.getUChar("mode", 0);
+  acState.fan = preferences.getUChar("fan", 0);
+  acState.swing_v = preferences.getBool("swing_v", true);
+  acState.sleep = preferences.getBool("sleep", false);
+  acState.turbo = preferences.getBool("turbo", false);
+  acState.xfan = preferences.getBool("xfan", false);
+  acState.light = preferences.getBool("light", true);
+  acState.ifeel = preferences.getBool("ifeel", false);
+  acState.displayTemp = preferences.getUChar("display_temp", 1);
+  preferences.end();
+
+  ac.setPower(acState.power);
+  ac.setTemp(acState.temp);
+  ac.setMode(acState.mode);
+  ac.setFan(acState.fan);
+  ac.setSwingVertical(acState.swing_v, kGreeSwingAuto);
+  ac.setSleep(acState.sleep);
+  ac.setTurbo(acState.turbo);
+  ac.setXFan(acState.xfan);
+  ac.setLight(acState.light);
+  ac.setIFeel(acState.ifeel);
+  ac.setDisplayTempSource(acState.displayTemp);
+}
+
+void saveAcState() {
+  preferences.begin("ac_state", false);
+  preferences.putBool("power", acState.power);
+  preferences.putUChar("temp", acState.temp);
+  preferences.putUChar("mode", acState.mode);
+  preferences.putUChar("fan", acState.fan);
+  preferences.putBool("swing_v", acState.swing_v);
+  preferences.putBool("sleep", acState.sleep);
+  preferences.putBool("turbo", acState.turbo);
+  preferences.putBool("xfan", acState.xfan);
+  preferences.putBool("light", acState.light);
+  preferences.putBool("ifeel", acState.ifeel);
+  preferences.putUChar("display_temp", acState.displayTemp);
   preferences.end();
 }
 
@@ -736,6 +807,7 @@ void loadSchedules()
     schedules[i].minute = obj["m"] | 0;
     schedules[i].action = obj["a"] | false;
     schedules[i].enabled = obj["e"] | false;
+    schedules[i].targetAc = obj["ac"] | 0;
 
     JsonArray rArr = obj["r"].as<JsonArray>();
     for (int r = 0; r < NUM_RELAYS; r++)
@@ -762,6 +834,7 @@ void saveSchedules()
     obj["m"] = schedules[i].minute;
     obj["a"] = schedules[i].action;
     obj["e"] = schedules[i].enabled;
+    obj["ac"] = schedules[i].targetAc;
     JsonArray rArr = obj["r"].to<JsonArray>();
     for (int r = 0; r < NUM_RELAYS; r++)
       rArr.add(schedules[i].targetRelays[r]);
@@ -840,8 +913,15 @@ void reconcileSchedules(int currentHour, int currentMinute)
   }
 }
 
-void applyChannelAction(bool targetRelays[], bool targetSwitches[], bool action)
+void applyChannelAction(bool targetRelays[], bool targetSwitches[], bool action, int targetAc)
 {
+  if (targetAc == 1 || targetAc == 2) {
+    bool acPwr = (targetAc == 1) ? action : !action;
+    acState.power = acPwr;
+    ac.setPower(acPwr);
+    saveAcState();
+    ac.send();
+  }
   for (int r = 0; r < NUM_RELAYS; r++)
   {
     if (targetRelays[r])
@@ -865,7 +945,7 @@ void checkSchedules(int h, int m)
     if (schedules[i].enabled &&
         getMinutesFromMidnight(schedules[i].hour, schedules[i].minute) == currentMin)
     {
-      applyChannelAction(schedules[i].targetRelays, schedules[i].targetSwitches, schedules[i].action);
+      applyChannelAction(schedules[i].targetRelays, schedules[i].targetSwitches, schedules[i].action, schedules[i].targetAc);
     }
   }
   lastEvaluatedMinute = currentMin;
@@ -874,6 +954,13 @@ void checkSchedules(int h, int m)
 // ---------------------------------------------------------------- Timer Engine Logic
 void applyTimerTargets(TimerItem &t, bool action)
 {
+  if (t.targetAc == 1 || t.targetAc == 2) {
+    bool acPwr = (t.targetAc == 1) ? action : !action;
+    acState.power = acPwr;
+    ac.setPower(acPwr);
+    saveAcState();
+    ac.send();
+  }
   for (int r = 0; r < NUM_RELAYS; r++)
   {
     if (t.targetRelays[r])
@@ -902,6 +989,7 @@ void saveTimers()
       obj["fin"] = timers[i].finished;
       obj["inv"] = timers[i].invertOnStartEnd;
       obj["act"] = timers[i].targetAction;
+      obj["ac"] = timers[i].targetAc;
       JsonArray rArr = obj["r"].to<JsonArray>();
       for (int r = 0; r < NUM_RELAYS; r++)
         rArr.add(timers[i].targetRelays[r]);
@@ -943,6 +1031,7 @@ void loadTimers()
     timers[slot].finished = obj["fin"] | false;
     timers[slot].invertOnStartEnd = obj["inv"] | false;
     timers[slot].targetAction = obj["act"] | false;
+    timers[slot].targetAc = obj["ac"] | 0;
     timers[slot].active = (timers[slot].remainingSec > 0) && !timers[slot].finished;
 
     JsonArray rArr = obj["r"].as<JsonArray>();
@@ -1110,6 +1199,35 @@ void updateOLED()
       display.print("No Timers");
     }
   }
+  else if (displayPage == 3)
+  {
+    // PAGE 3: AC STATUS
+    drawOledHeader("- AC REMOTE -");
+    display.setCursor(0, 14);
+    if (ac.getPower()) {
+      display.print("Power: ON");
+      display.setCursor(70, 14);
+      display.printf("Temp: %dC", ac.getTemp());
+      
+      display.setCursor(0, 26);
+      const char* modes[] = {"Auto", "Cool", "Dry", "Fan", "Heat"};
+      uint8_t m = ac.getMode();
+      display.printf("Mode: %s", (m <= 4) ? modes[m] : "?");
+      
+      display.setCursor(70, 26);
+      const char* fans[] = {"Auto", "Min", "Med", "Max"};
+      uint8_t f = ac.getFan();
+      display.printf("Fan: %s", (f <= 3) ? fans[f] : "?");
+
+      display.setCursor(0, 38);
+      display.printf("Swing: %s", ac.getSwingVerticalAuto() ? "ON" : "OFF");
+      
+      display.setCursor(70, 38);
+      display.printf("Sleep: %s", ac.getSleep() ? "ON" : "OFF");
+    } else {
+      display.print("Power: OFF");
+    }
+  }
 
   drawOledFooter();
   display.display();
@@ -1184,7 +1302,8 @@ void handleButtonPress()
     unsigned long duration = millis() - buttonPressTime;
     if (!isHolding && duration < 1000)
     {
-      displayPage = (displayPage + 1) % 3;
+      int maxPages = acActive ? 4 : 3;
+      displayPage = (displayPage + 1) % maxPages;
       updateOLED();
     }
     else if (isHolding)
@@ -1229,6 +1348,7 @@ void processTimerRequest(JsonDocument &doc, AsyncWebServerRequest *request)
       timers[freeSlot].finished         = false;
       timers[freeSlot].invertOnStartEnd = doc["invertOnStartEnd"] | false;
       timers[freeSlot].targetAction     = (doc["targetAction"] == "ON");
+      timers[freeSlot].targetAc         = doc["targetAc"] | 0;
 
       JsonArray rArr = doc["targetRelays"].as<JsonArray>();
       for (int r = 0; r < NUM_RELAYS; r++)
@@ -1279,6 +1399,10 @@ void processTimerRequest(JsonDocument &doc, AsyncWebServerRequest *request)
         if (doc["targetAction"].is<const char *>())
         {
           timers[i].targetAction = (doc["targetAction"] == "ON");
+        }
+        if (doc["targetAc"].is<int>())
+        {
+          timers[i].targetAc = doc["targetAc"].as<int>();
         }
         if (doc["targetRelays"].is<JsonArray>())
         {
@@ -1372,6 +1496,7 @@ void setupAPI()
     doc["device_name"]    = "R-Sync ESP32 Server";
     doc["version"]        = "3.0.0";
     doc["oled_connected"] = oledConnected;
+    doc["ac_feature"]     = acActive;
 
     int activeRelayCount   = 0;
     int activeSwitchCount  = 0;
@@ -1461,6 +1586,7 @@ void setupAPI()
         obj["finished"]        = timers[i].finished;
         obj["invertOnStartEnd"] = timers[i].invertOnStartEnd;
         obj["targetAction"]    = timers[i].targetAction ? "ON" : "OFF";
+        obj["targetAc"]        = timers[i].targetAc;
         JsonArray rT = obj["targetRelays"].to<JsonArray>();
         for (int r = 0; r < NUM_RELAYS; r++) rT.add(timers[i].targetRelays[r]);
         JsonArray sT = obj["targetSwitches"].to<JsonArray>();
@@ -1480,6 +1606,19 @@ void setupAPI()
       JsonArray sS = obj["s"].to<JsonArray>();
       for (int sw = 0; sw < NUM_SWITCHES; sw++) sS.add(schedules[i].targetSwitches[sw]);
     }
+
+    JsonObject acObj = doc["ac"].to<JsonObject>();
+    acObj["power"] = acState.power;
+    acObj["temp"] = acState.temp;
+    acObj["mode"] = acState.mode;
+    acObj["fan"] = acState.fan;
+    acObj["swing_v"] = acState.swing_v;
+    acObj["sleep"] = acState.sleep;
+    acObj["turbo"] = acState.turbo;
+    acObj["xfan"] = acState.xfan;
+    acObj["light"] = acState.light;
+    acObj["ifeel"] = acState.ifeel;
+    acObj["display_temp"] = acState.displayTemp;
 
     String response;
     serializeJson(doc, response);
@@ -1583,6 +1722,39 @@ void setupAPI()
         }
       }
       request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload Switch\"}"); });
+
+  // 5.5 POST /api/ac
+  server.on("/api/ac", HTTP_ANY, [](AsyncWebServerRequest *req)
+            {
+    if (req->method() == HTTP_OPTIONS) req->send(200); }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+      if (request->method() == HTTP_OPTIONS) return;
+      if (request->url() != "/api/ac") return;
+      if (!acActive) {
+        request->send(403, "application/json", "{\"status\":\"Error\",\"message\":\"AC Disabled\"}");
+        return;
+      }
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, data, len);
+      if (!error) {
+        if (doc.containsKey("power")) { acState.power = doc["power"].as<bool>(); ac.setPower(acState.power); }
+        if (doc.containsKey("temp")) { acState.temp = doc["temp"].as<uint8_t>(); ac.setTemp(acState.temp); }
+        if (doc.containsKey("mode")) { acState.mode = doc["mode"].as<uint8_t>(); ac.setMode(acState.mode); }
+        if (doc.containsKey("fan")) { acState.fan = doc["fan"].as<uint8_t>(); ac.setFan(acState.fan); }
+        if (doc.containsKey("swing_v")) { acState.swing_v = doc["swing_v"].as<bool>(); ac.setSwingVertical(acState.swing_v, kGreeSwingAuto); }
+        if (doc.containsKey("sleep")) { acState.sleep = doc["sleep"].as<bool>(); ac.setSleep(acState.sleep); }
+        if (doc.containsKey("turbo")) { acState.turbo = doc["turbo"].as<bool>(); ac.setTurbo(acState.turbo); }
+        if (doc.containsKey("xfan")) { acState.xfan = doc["xfan"].as<bool>(); ac.setXFan(acState.xfan); }
+        if (doc.containsKey("light")) { acState.light = doc["light"].as<bool>(); ac.setLight(acState.light); }
+        if (doc.containsKey("ifeel")) { acState.ifeel = doc["ifeel"].as<bool>(); ac.setIFeel(acState.ifeel); }
+        if (doc.containsKey("display_temp")) { acState.displayTemp = doc["display_temp"].as<uint8_t>(); ac.setDisplayTempSource(acState.displayTemp); }
+        
+        saveAcState();
+        ac.send();
+        request->send(200, "application/json", "{\"status\":\"OK\"}");
+        return;
+      }
+      request->send(400, "application/json", "{\"status\":\"Error\",\"message\":\"Bad Payload AC\"}"); });
 
   // 6. POST /api/servo/test (supports testing all or individual servo via {"servo": 0..5} or ?servo=0..5)
   auto servoTestHandler = [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
@@ -1775,10 +1947,11 @@ void setupAPI()
             {
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
+      int maxPages = acActive ? 4 : 3;
       if (!error && doc["page"].is<int>()) {
-        displayPage = doc["page"].as<int>() % 3;
+        displayPage = doc["page"].as<int>() % maxPages;
       } else {
-        displayPage = (displayPage + 1) % 3;
+        displayPage = (displayPage + 1) % maxPages;
       }
       updateOLED();
       request->send(200, "application/json",
@@ -1791,6 +1964,7 @@ void setupAPI()
     for (int i = 0; i < NUM_RELAYS; i++) rArr.add(relayActive[i]);
     JsonArray sArr = doc["switches"].to<JsonArray>();
     for (int i = 0; i < NUM_SWITCHES; i++) sArr.add(switchActive[i]);
+    doc["ac"] = acActive;
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response); });
@@ -1815,6 +1989,10 @@ void setupAPI()
             switchActive[i] = sArr[i].as<bool>();
           }
         }
+        if (doc.containsKey("ac")) {
+          acActive = doc["ac"].as<bool>();
+          if (!acActive && displayPage == 3) displayPage = 0; // fallback if on AC page
+        }
         saveHardwareConfig();
         request->send(200, "application/json", "{\"status\":\"OK\"}");
         return;
@@ -1835,10 +2013,13 @@ void setup()
 {
   Serial.begin(115200);
 
+  ac.begin();
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   loadPolarity();
   loadHardwareConfig();
+  loadAcState();
 
   for (int r = 0; r < NUM_RELAYS; r++)
   {

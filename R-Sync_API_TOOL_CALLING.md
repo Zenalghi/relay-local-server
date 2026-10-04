@@ -18,12 +18,27 @@ Sebelum memanggil fungsi/tool apapun, LLM harus memahami batasan fisik dan atura
 | **Switch A** | Saklar Tembok A | `switch: 0` (0-indexed) | `targetSwitches[0]` | `GPIO 14` (ON) / `GPIO 27` (OFF) | Servo 0 (ON) & Servo 1 (OFF) |
 | **Switch B** | Saklar Tembok B | `switch: 1` (0-indexed) | `targetSwitches[1]` | `GPIO 26` (ON) / `GPIO 25` (OFF) | Servo 2 (ON) & Servo 3 (OFF) |
 | **Switch C** | Saklar Tembok C | `switch: 2` (0-indexed) | `targetSwitches[2]` | `GPIO 33` (ON) / `GPIO 32` (OFF) | Servo 4 (ON) & Servo 5 (OFF) |
+| **AC Remote** | IR Emitter | `targetAc: 1` (ON) / `2` (OFF) | `targetAc` (0,1,2) | `GPIO 18` | Transmiter IR (Gree/FLiFE) |
 
 > ⚠️ **PERINGATAN KRITIS INDEXING UNTUK LLM:**
 > - Endpoint `/api/relay` menggunakan `channel` bernilai **1 sampai 4** (1-based).
 > - Endpoint `/api/switch` menggunakan `switch` bernilai **0 sampai 2** (0-based: 0 = Saklar A, 1 = Saklar B, 2 = Saklar C).
 > - Pada payload array `targetRelays`, selalu berupa array 4 boolean: `[Relay1, Relay2, Relay3, Relay4]`.
 > - Pada payload array `targetSwitches`, selalu berupa array 3 boolean: `[SwitchA, SwitchB, SwitchC]`.
+> - Parameter `targetAc` bernilai **0** (Abaikan/Ignore), **1** (Power ON AC), atau **2** (Power OFF AC).
+
+### 1.1b Karakteristik Transmisi IR AC (FLiFE / Gree) & Idempotensi
+- **Paket State Penuh (Full Frame Transmission):** Protokol IR Gree/FLiFE tidak mengirim tombol mentah, melainkan **seluruh status AC** (Power, Suhu, Mode, Fan, Swing, Turbo, Sleep, X-Fan, Light, I-Feel, Display Temp) dalam satu paket sinyal 64-bit lengkap setiap kali dikirim.
+- **Non-Toggle & Idempoten (Sangat Aman untuk AI):**
+  - Perintah daya bersifat mutlak: `power: true` selalu menyalakan, `power: false` selalu mematikan.
+  - Jika AC saat ini sudah mati dan AI mengirim `power: false`, AC **tetap mati** (TIDAK akan tertukar/toggle menyala).
+  - Begitu pula suhu: jika AC sudah di 24°C dan AI mengirim `temp: 24`, AC tetap di 24°C.
+- **Dukungan Partial Update (Delta State):**
+  - Endpoint `/api/ac` mendukung payload parsial (misal hanya mengirim `{"temp": 22}`). Parameter lain yang tidak disertakan akan mempertahankan nilai terakhir yang tersimpan di flash ESP32 NVS (*Preferences*).
+- **Integrasi Timer & Scheduler (`targetAc`):**
+  - `0`: Abaikan AC (jangan ubah status AC).
+  - `1`: Targetkan AC Menyala (`Power ON`).
+  - `2`: Targetkan AC Mati (`Power OFF`).
 
 ### 1.2 Servo Non-Blocking & Anti-Brownout
 - Firmware menggunakan **FIFO Queue** (maksimal 12 antrean).
@@ -53,18 +68,19 @@ Header: `Content-Type: application/json` (CORS diaktifkan secara universal `*`).
 | `GET` | `/api/status` | Baca kondisi real-time lengkap perangkat | Tidak ada |
 | `POST` | `/api/relay` | Kontrol Relay 1..4 | `{"channel": 1..4, "state": "ON"\|"OFF"}` |
 | `POST` | `/api/switch` | Kontrol Saklar Tembok A..C via Servo | `{"switch": 0..2, "state": "ON"\|"OFF"}` |
+| `POST` | `/api/ac` | Kontrol Remote AC FLiFE / Gree (IR) | `{"power", "temp", "mode", "fan", "swing_v", ...}` |
 | `GET`/`POST` | `/api/relay/polarity` | Cek atau ubah polaritas relay | Query/Body: `{"activeLow": boolean}` |
-| `POST` | `/api/timer` | Operasi lengkap timer (Add/Update/Control) | `action`, `durationSec`, `id`, dll |
-| `POST` | `/api/timer/add` | (Alias) Tambah timer hitung mundur | `durationSec`, `targetAction`, `targetRelays`, `targetSwitches` |
-| `POST` | `/api/timer/update` | (Alias) Edit timer yang sudah ada | `id`, `durationSec`, dll |
+| `POST` | `/api/timer` | Operasi lengkap timer (Add/Update/Control) | `action`, `durationSec`, `targetAc`, dll |
+| `POST` | `/api/timer/add` | (Alias) Tambah timer hitung mundur | `durationSec`, `targetAction`, `targetAc`, `targetRelays`, `targetSwitches` |
+| `POST` | `/api/timer/update` | (Alias) Edit timer yang sudah ada | `id`, `durationSec`, `targetAc`, dll |
 | `POST` | `/api/timer/control` | (Alias) Jeda/Lanjut/Hentikan timer | `{"id": int, "command": "pause"\|"resume"\|"cancel"\|"start"}` |
 | `GET` | `/api/schedules` | Ambil seluruh 10 slot jadwal | Tidak ada |
-| `POST` | `/api/schedules` | Setel / timpa daftar 10 jadwal | Array JSON jadwal `[{h, m, a, e, r, s}, ...]` |
+| `POST` | `/api/schedules` | Setel / timpa daftar 10 jadwal | Array JSON jadwal `[{h, m, a, e, targetAc, r, s}, ...]` |
 | `POST` | `/api/servo/config` | Kalibrasi sudut rest & tekan servo | `restAngle`, `pressAngle`, `pressAngles`, `pressDurationMs` |
 | `POST` | `/api/servo/test` | Uji coba fisik servo (*Self-Test*) | Query/Body: `{"servo": 0..5}` (opsional) |
-| `POST` | `/api/display` | Ganti halaman tampilan layar OLED | `{"page": 0..2}` (opsional) |
-| `GET` | `/api/hardware/config` | Cek channel relay/saklar yang aktif | Tidak ada |
-| `POST` | `/api/hardware/config` | Aktifkan/nonaktifkan channel fisik | `{"relays": [4 bool], "switches": [3 bool]}` |
+| `POST` | `/api/display` | Ganti halaman tampilan layar OLED | `{"page": 0..3}` (opsional) |
+| `GET` | `/api/hardware/config` | Cek channel relay/saklar/AC yang aktif | Tidak ada |
+| `POST` | `/api/hardware/config` | Aktifkan/nonaktifkan channel fisik/AC | `{"relays": [4 bool], "switches": [3 bool], "ac": bool}` |
 | `POST` | `/api/wifi/reset` | Hapus konfigurasi WiFi & restart AP | Tidak ada |
 
 ---
@@ -85,6 +101,7 @@ Mendapatkan spesifikasi kapabilitas firmware dan hardware yang sedang aktif.
     "device_name": "R-Sync ESP32 Server",
     "version": "3.0.0",
     "oled_connected": true,
+    "ac_feature": true,
     "active_relays": [true, true, true, true],
     "active_switches": [true, true, true],
     "relays_count": 4,
@@ -139,6 +156,7 @@ Mendapatkan status operasional menyeluruh perangkat secara real-time.
         "finished": false,
         "invertOnStartEnd": true,
         "targetAction": "OFF",
+        "targetAc": 2,
         "targetRelays": [true, false, false, false],
         "targetSwitches": [false, false, false]
       }
@@ -149,16 +167,38 @@ Mendapatkan status operasional menyeluruh perangkat secara real-time.
         "m": 30,
         "a": "ON",
         "e": true,
+        "targetAc": 1,
         "r": [true, true, false, false],
         "s": [false, false, false]
       }
-    ]
+    ],
+    "ac": {
+      "power": false,
+      "temp": 24,
+      "mode": 1,
+      "fan": 0,
+      "swing_v": true,
+      "sleep": false,
+      "turbo": false,
+      "xfan": false,
+      "light": true,
+      "ifeel": false,
+      "display_temp": 1
+    }
   }
   ```
   *Keterangan Field Kritis:*
   - `time`: Jika bernilai `"Not Synced"`, NTP belum mendapatkan jam akurat.
   - `servoAngles`: Nilai `-1` menandakan servo dalam kondisi **detached** (mati / tanpa torsi idle).
   - `servoBusy`: `true` jika servo sedang bergerak, menjalankan self-test, atau menyelaraskan sudut.
+  - `ac`: Objek status remote AC FLiFE / Gree yang sedang aktif tersimpan di ESP32 flash Preferences.
+    - `power` (bool): Status hidup/mati AC.
+    - `temp` (int): Suhu setelan (16..30 °C).
+    - `mode` (int): `0` = AUTO, `1` = COOL, `2` = DRY, `3` = FAN, `4` = HEAT.
+    - `fan` (int): `0` = AUTO, `1` = MIN, `2` = MED, `3` = MAX.
+    - `swing_v` (bool): Swing vertikal auto (true) atau diam (false).
+    - `sleep`, `turbo`, `xfan`, `light`, `ifeel` (bool): Fitur kenyamanan.
+    - `display_temp` (int): `0` = OFF, `1` = SET TEMP, `2` = INSIDE TEMP, `3` = OUTSIDE TEMP.
 
 ---
 
@@ -238,6 +278,67 @@ Mengecek atau mengonfigurasi polaritas aktif relay (`activeLow`).
 
 ---
 
+### 3.5b `POST /api/ac` (Kontrol Remote AC FLiFE / Gree IR)
+Mengirimkan perintah infrared ke unit Air Conditioner Gree / FLiFE (YAW1F protocol) melalui GPIO 18. Perintah bersifat idempoten (non-toggle) dan mendukung update parsial.
+
+- **Request (Semua field bersifat opsional, kirimkan yang ingin diubah saja):**
+  ```json
+  POST /api/ac
+  Content-Type: application/json
+
+  {
+    "power": true,
+    "temp": 24,
+    "mode": 1,
+    "fan": 3,
+    "swing_v": true,
+    "sleep": false,
+    "turbo": false,
+    "xfan": false,
+    "light": true,
+    "ifeel": false,
+    "display_temp": 1
+  }
+  ```
+  - `power` (boolean): `true` = Hidupkan AC, `false` = Matikan AC.
+  - `temp` (integer): Suhu target dalam °C, jangkauan: `16` sampai `30`.
+  - `mode` (integer):
+    - `0`: AUTO (Otomatis)
+    - `1`: COOL (Pendingin / Dingin)
+    - `2`: DRY (Dehumidifier / Kering)
+    - `3`: FAN (Hanya kipas angin)
+    - `4`: HEAT (Pemanas)
+  - `fan` (integer):
+    - `0`: AUTO (Kecepatan kipas otomatis)
+    - `1`: MIN (Kecepatan 1 / Pelan)
+    - `2`: MED (Kecepatan 2 / Sedang)
+    - `3`: MAX (Kecepatan 3 / Kencang)
+  - `swing_v` (boolean): `true` = Swing vertikal bergerak otomatis naik-turun, `false` = Swing berhenti di sudut saat ini.
+  - `sleep` (boolean): `true` = Mode tidur aktif (suhu dinaikkan bertahap untuk kenyamanan), `false` = Nonaktif.
+  - `turbo` (boolean): `true` = Mode turbo pendinginan maksimal aktif, `false` = Normal.
+  - `xfan` (boolean): `true` = Fitur pengering blower evaporator setelah AC mati agar tidak bau/berjamur, `false` = Nonaktif.
+  - `light` (boolean): `true` = Layar LED suhu pada unit indoor AC menyala, `false` = Gelap/mati.
+  - `ifeel` (boolean): `true` = Mode sensor suhu I-Feel aktif, `false` = Nonaktif.
+  - `display_temp` (integer):
+    - `0`: OFF (Tidak ada tampilan angka suhu)
+    - `1`: SET TEMP (Tampilkan suhu setelan target)
+    - `2`: INSIDE TEMP (Tampilkan suhu ruangan terdeteksi)
+    - `3`: OUTSIDE TEMP (Tampilkan suhu luar ruangan)
+- **Response 200 OK:**
+  ```json
+  { "status": "OK" }
+  ```
+- **Response 403 Forbidden (Jika hardware AC dinonaktifkan di config):**
+  ```json
+  { "status": "Error", "message": "AC Disabled" }
+  ```
+- **Response 400 Bad Request:**
+  ```json
+  { "status": "Error", "message": "Bad Payload AC" }
+  ```
+
+---
+
 ### 3.6 `POST /api/timer` (Unified Timer Engine)
 Mengelola seluruh fungsionalitas timer hitung mundur (Add, Update, Control, Delete).
 
@@ -251,6 +352,7 @@ Content-Type: application/json
   "durationSec": 300,
   "invertOnStartEnd": true,
   "targetAction": "OFF",
+  "targetAc": 2,
   "targetRelays": [true, false, false, false],
   "targetSwitches": [false, true, false]
 }
@@ -260,6 +362,10 @@ Content-Type: application/json
   - Jika `true`: Pada detik ke-0 (saat timer dibuat/dimulai), perangkat target langsung di-trigger ke status **kebalikan** dari `targetAction` (misal di-ON-kan). Setelah durasi habis, perangkat target di-trigger ke `targetAction` (misal di-OFF-kan).
   - Jika `false`: Perangkat target hanya disentuh saat durasi berakhir.
 - `targetAction` (string): `"ON"` atau `"OFF"`. Aksi yang dijalankan ketika countdown mencapai `0`.
+- `targetAc` (integer):
+  - `0`: Abaikan AC (tidak mengubah status AC).
+  - `1`: Targetkan AC Menyala (`Power ON`).
+  - `2`: Targetkan AC Mati (`Power OFF`).
 - `targetRelays`: Array 4 boolean `[R1, R2, R3, R4]`.
 - `targetSwitches`: Array 3 boolean `[SwA, SwB, SwC]`.
 
@@ -301,6 +407,7 @@ Content-Type: application/json
   "durationSec": 600,
   "invertOnStartEnd": false,
   "targetAction": "ON",
+  "targetAc": 1,
   "targetRelays": [true, true, false, false],
   "targetSwitches": [false, false, false]
 }
@@ -323,6 +430,7 @@ Manajemen jadwal otomatis harian berbasis jam NTP (maksimal 10 slot).
       "m": 0,
       "a": "OFF",
       "e": true,
+      "targetAc": 2,
       "r": [true, false, false, false],
       "s": [false, false, false]
     },
@@ -331,6 +439,7 @@ Manajemen jadwal otomatis harian berbasis jam NTP (maksimal 10 slot).
       "m": 30,
       "a": "ON",
       "e": true,
+      "targetAc": 1,
       "r": [true, false, false, false],
       "s": [false, false, false]
     }
@@ -348,16 +457,18 @@ Manajemen jadwal otomatis harian berbasis jam NTP (maksimal 10 slot).
       "m": 45,
       "a": "ON",
       "e": true,
+      "targetAc": 1,
       "r": [true, true, false, false],
       "s": [true, false, false]
     }
   ]
   ```
   *Struktur Object Jadwal:*
-  - `h`: Jam (0 - 23).
+  - `h`: Jam (0 - 23 WIB).
   - `m`: Menit (0 - 59).
   - `a`: Target aksi `"ON"` atau `"OFF"`.
   - `e`: Status aktif `true` / `false`.
+  - `targetAc`: `0` = Abaikan AC, `1` = Paksa ON, `2` = Paksa OFF.
   - `r`: Array 4 boolean untuk Relay 1..4.
   - `s`: Array 3 boolean untuk Saklar A..C.
 
@@ -421,7 +532,8 @@ Mengubah halaman yang ditampilkan pada layar OLED 128x64 I2C.
     - `0`: Tampilan status IP, WiFi, Relay 1..4, dan Saklar A..C.
     - `1`: Tampilan jadwal harian yang sedang aktif.
     - `2`: Tampilan daftar timer aktif / hitung mundur.
-  - *Catatan:* Jika `page` tidak disertakan, display otomatis berpindah ke halaman berikutnya (siklus `0 -> 1 -> 2 -> 0`).
+    - `3`: Tampilan status Remote AC FLiFE (Power, Suhu, Mode, Fan).
+  - *Catatan:* Jika `page` tidak disertakan, display otomatis berpindah ke halaman berikutnya (siklus `0 -> 1 -> 2 -> 3 -> 0`). Jika AC dinonaktifkan, siklus hanya 3 halaman (`0..2`).
 
 ---
 
@@ -436,7 +548,8 @@ Menonaktifkan / mengaktifkan channel hardware tertentu secara permanen (disimpan
   ```json
   {
     "relays": [true, true, true, true],
-    "switches": [true, true, true]
+    "switches": [true, true, true],
+    "ac": true
   }
   ```
 - **Mengubah Konfigurasi Hardware:**
@@ -446,10 +559,13 @@ Menonaktifkan / mengaktifkan channel hardware tertentu secara permanen (disimpan
 
   {
     "relays": [true, true, true, false],
-    "switches": [true, true, true]
+    "switches": [true, true, true],
+    "ac": true
   }
   ```
-  *Catatan:* Jika suatu channel relay dinonaktifkan (`false`), output GPIO relay tersebut langsung dipaksa mati (`OFF`) dan tidak akan merespons perintah kontrol relay apapun.
+  *Catatan:*
+  - Jika suatu channel relay dinonaktifkan (`false`), output GPIO relay tersebut langsung dipaksa mati (`OFF`) dan tidak akan merespons perintah kontrol relay apapun.
+  - Jika `ac: false`, pemanggilan `/api/ac` akan mengembalikan kode HTTP `403 Forbidden` (`AC Disabled`).
 
 ---
 
@@ -546,8 +662,70 @@ Salin definisi JSON Schema di bawah ini ke dalam konfigurasi `tools` pada local 
   {
     "type": "function",
     "function": {
+      "name": "control_ac",
+      "description": "Kontrol unit Air Conditioner (AC) FLiFE / Gree melalui transmisi sinyal Infrared (IR). Perintah bersifat non-toggle (aman dan idempoten): mengirim power=false saat AC mati tidak akan menyalakan AC. Menerima update parsial (parameter yang tidak disertakan akan mempertahankan nilai sebelumnya yang tersimpan di flash ESP32).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "power": {
+            "type": "boolean",
+            "description": "Nyalakan (true) atau matikan (false) AC. Bersifat idempoten (bukan toggle)."
+          },
+          "temp": {
+            "type": "integer",
+            "minimum": 16,
+            "maximum": 30,
+            "description": "Target suhu AC dalam derajat Celsius (16 - 30 °C)."
+          },
+          "mode": {
+            "type": "integer",
+            "enum": [0, 1, 2, 3, 4],
+            "description": "Mode operasi AC: 0 = AUTO (Otomatis), 1 = COOL (Pendingin/Dingin), 2 = DRY (Pengering Kelembaban), 3 = FAN (Hanya Kipas), 4 = HEAT (Pemanas)."
+          },
+          "fan": {
+            "type": "integer",
+            "enum": [0, 1, 2, 3],
+            "description": "Kecepatan hembusan kipas angin: 0 = AUTO (Otomatis), 1 = MIN (Kecepatan 1/Lembut), 2 = MED (Kecepatan 2/Sedang), 3 = MAX (Kecepatan 3/Kencang)."
+          },
+          "swing_v": {
+            "type": "boolean",
+            "description": "Swing sirip vertikal: true = Sirip bergerak naik-turun otomatis, false = Sirip diam pada posisi saat ini."
+          },
+          "turbo": {
+            "type": "boolean",
+            "description": "Mode Turbo pendinginan instan berkecepatan ekstra tinggi: true = Aktif, false = Nonaktif."
+          },
+          "sleep": {
+            "type": "boolean",
+            "description": "Mode Sleep / Kenyamanan tidur (menyesuaikan suhu bertahap di malam hari): true = Aktif, false = Nonaktif."
+          },
+          "xfan": {
+            "type": "boolean",
+            "description": "Mode X-Fan (Blow/Pengering internal): meniupkan udara setelah AC dimatikan untuk mencegah jamur pada evaporator: true = Aktif, false = Nonaktif."
+          },
+          "light": {
+            "type": "boolean",
+            "description": "Lampu LED layar display indikator suhu pada unit indoor AC: true = Menyala, false = Mati (gelap)."
+          },
+          "ifeel": {
+            "type": "boolean",
+            "description": "Mode I-Feel (sensor suhu remote control): true = Aktif, false = Nonaktif."
+          },
+          "display_temp": {
+            "type": "integer",
+            "enum": [0, 1, 2, 3],
+            "description": "Pilihan informasi suhu yang ditampilkan di layar LED AC: 0 = OFF (Mati), 1 = SET (Suhu Target/Setelan), 2 = INSIDE (Suhu Ruangan Saat Ini), 3 = OUTSIDE (Suhu Luar Ruangan)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "create_countdown_timer",
-      "description": "Buat pewaktu hitung mundur (countdown timer) untuk mematikan atau menyalakan relay/saklar setelah durasi tertentu.",
+      "description": "Buat pewaktu hitung mundur (countdown timer) untuk mematikan atau menyalakan relay/saklar/AC setelah durasi tertentu.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -560,6 +738,11 @@ Salin definisi JSON Schema di bawah ini ke dalam konfigurasi `tools` pada local 
             "type": "string",
             "enum": ["ON", "OFF"],
             "description": "Aksi yang dieksekusi saat hitungan mundur selesai."
+          },
+          "target_ac": {
+            "type": "integer",
+            "enum": [0, 1, 2],
+            "description": "Kontrol AC saat timer berakhir: 0 = Abaikan AC, 1 = Nyalakan AC (Power ON), 2 = Matikan AC (Power OFF). Bersifat non-toggle."
           },
           "invert_on_start_end": {
             "type": "boolean",
@@ -636,6 +819,11 @@ Salin definisi JSON Schema di bawah ini ke dalam konfigurasi `tools` pada local 
                 "m": { "type": "integer", "minimum": 0, "maximum": 59, "description": "Menit (0-59)" },
                 "a": { "type": "string", "enum": ["ON", "OFF"], "description": "Aksi target saat jadwal tercapai" },
                 "e": { "type": "boolean", "description": "Status aktif jadwal (true = aktif, false = dinonaktifkan)" },
+                "target_ac": {
+                  "type": "integer",
+                  "enum": [0, 1, 2],
+                  "description": "Aksi target AC: 0 = Abaikan, 1 = Nyalakan AC (Power ON), 2 = Matikan AC (Power OFF)"
+                },
                 "r": {
                   "type": "array",
                   "items": { "type": "boolean" },
@@ -669,8 +857,8 @@ Salin definisi JSON Schema di bawah ini ke dalam konfigurasi `tools` pada local 
         "properties": {
           "page": {
             "type": "integer",
-            "enum": [0, 1, 2],
-            "description": "Nomor halaman: 0 = Status Ringkas, 1 = Jadwal Harian, 2 = Timer Aktif."
+            "enum": [0, 1, 2, 3],
+            "description": "Nomor halaman: 0 = Status Ringkas, 1 = Jadwal Harian, 2 = Timer Aktif, 3 = Remote AC."
           }
         },
         "required": ["page"]
@@ -758,11 +946,51 @@ def control_wall_switch(switch_index: int, state: str) -> Dict[str, Any]:
     resp.raise_for_status()
     return resp.json()
 
+def control_ac(
+    power: Optional[bool] = None,
+    temp: Optional[int] = None,
+    mode: Optional[int] = None,
+    fan: Optional[int] = None,
+    swing_v: Optional[bool] = None,
+    sleep: Optional[bool] = None,
+    turbo: Optional[bool] = None,
+    xfan: Optional[bool] = None,
+    light: Optional[bool] = None,
+    ifeel: Optional[bool] = None,
+    display_temp: Optional[int] = None
+) -> Dict[str, Any]:
+    url = f"{ESP32_BASE_URL}/api/ac"
+    payload: Dict[str, Any] = {}
+    if power is not None: payload["power"] = power
+    if temp is not None:
+        assert 16 <= temp <= 30, "Suhu harus antara 16 sampai 30 °C"
+        payload["temp"] = temp
+    if mode is not None:
+        assert mode in [0, 1, 2, 3, 4], "Mode: 0=AUTO, 1=COOL, 2=DRY, 3=FAN, 4=HEAT"
+        payload["mode"] = mode
+    if fan is not None:
+        assert fan in [0, 1, 2, 3], "Fan: 0=AUTO, 1=MIN, 2=MED, 3=MAX"
+        payload["fan"] = fan
+    if swing_v is not None: payload["swing_v"] = swing_v
+    if sleep is not None: payload["sleep"] = sleep
+    if turbo is not None: payload["turbo"] = turbo
+    if xfan is not None: payload["xfan"] = xfan
+    if light is not None: payload["light"] = light
+    if ifeel is not None: payload["ifeel"] = ifeel
+    if display_temp is not None:
+        assert display_temp in [0, 1, 2, 3], "Display temp: 0=OFF, 1=SET, 2=INSIDE, 3=OUTSIDE"
+        payload["display_temp"] = display_temp
+    
+    resp = requests.post(url, json=payload, timeout=TIMEOUT_SEC)
+    resp.raise_for_status()
+    return resp.json()
+
 def create_countdown_timer(
     duration_sec: int,
     target_action: str,
     target_relays: List[bool],
     target_switches: List[bool],
+    target_ac: int = 0,
     invert_on_start_end: bool = False
 ) -> Dict[str, Any]:
     url = f"{ESP32_BASE_URL}/api/timer"
@@ -771,6 +999,7 @@ def create_countdown_timer(
         "durationSec": duration_sec,
         "invertOnStartEnd": invert_on_start_end,
         "targetAction": target_action,
+        "targetAc": target_ac,
         "targetRelays": target_relays,
         "targetSwitches": target_switches
     }
@@ -821,11 +1050,43 @@ def set_relay_polarity(active_low: bool) -> Dict[str, Any]:
 
 ---
 
-## 6. Skenario Prompting & Pola Pikir LLM (Few-Shot Examples)
+## 6. Format Definisi Skill Agen (Hermes Agent / OpenClaw `SKILL.md`)
+
+Bagi pengguna framework **Hermes Agent** (Nous Research) atau **OpenClaw Agent**, simpan blok markdown di bawah ini sebagai file `skills/r_sync_controller/SKILL.md` agar agen langsung memahami seluruh cara mengoperasikan perangkat R-Sync secara otomatis:
+
+```markdown
+---
+name: r_sync_smart_controller
+description: "Kontrol cerdas perangkat IoT ESP32 R-Sync: 4 Relay Listrik, 3 Saklar Tembok Mekanis Servo, Remote AC IR FLiFE/Gree, Countdown Timer, dan Penjadwalan NTP."
+---
+
+# R-Sync Controller Skill
+
+Gunakan skill ini ketika pengguna meminta untuk:
+1. Menyalakan atau mematikan lampu, stopkontak, atau pompa (Relay 1..4).
+2. Menekan saklar dinding fisik A, B, atau C menggunakan motor servo.
+3. Mengontrol AC FLiFE / Gree (mengatur suhu 16-30°C, mode COOL/AUTO/DRY/FAN/HEAT, fan speed, swing, turbo, sleep, atau mematikan AC).
+4. Menyetel timer hitung mundur untuk mematikan perangkat setelah durasi tertentu.
+5. Menyetel jadwal otomatis berbasis jam WIB harian.
+6. Memeriksa status real-time atau mengubah halaman display OLED.
+
+## Aturan Perilaku AI:
+- **Idempotensi AC:** Kontrol AC menggunakan paket IR non-toggle. Mengirim perintah `power: false` ketika AC sudah mati adalah 100% aman dan tidak akan menyalakan AC secara tidak sengaja.
+- **Dukungan Partial State:** Anda tidak perlu menyertakan semua parameter AC saat memanggil `control_ac`. Cukup sertakan parameter yang diminta pengguna (misal hanya `{"temp": 24}`).
+- **Keselamatan Indeks:**
+  - Relay: 1..4 (1-indexed)
+  - Saklar dinding: 0..2 (0 = Saklar A, 1 = Saklar B, 2 = Saklar C)
+  - target_ac pada timer/jadwal: 0 = Jangan sentuh AC, 1 = ON, 2 = OFF
+- **Cek Status Dulu jika Ragu:** Jika pengguna bertanya apakah suatu lampu atau AC sedang hidup, panggil `get_device_status` terlebih dahulu sebelum menjawab.
+```
+
+---
+
+## 7. Skenario Prompting & Pola Pikir LLM (Few-Shot Examples)
 
 Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LLM tidak salah memilih tool:
 
-### Contoh Skenario 1: Menyalakan Lampu Utama
+### Contoh Skenario 1: Menyalakan Lampu Utama (Relay)
 - **User:** "Tolong nyalakan lampu utama di Relay 1 dong."
 - **LLM Reasoning:** User meminta menyalakan Relay 1. Sesuai aturan, nomor relay adalah 1 (1-indexed) dan target state adalah "ON".
 - **Tool Call:**
@@ -841,13 +1102,85 @@ Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LL
 
 ---
 
-### Contoh Skenario 2: Menyalakan Pompa Selama 15 Menit Lalu Mati Otomatis
+### Contoh Skenario 2: Mengatur Suhu dan Mode AC
+- **User:** "Dinginkan kamar tidur, tolong setel AC ke 22 derajat mode Cool dan fan kencang ya."
+- **LLM Reasoning:**
+  1. Pengguna ingin menyalakan / mengontrol AC kamar.
+  2. Suhu: 22°C (`temp: 22`).
+  3. Mode: Cool (`mode: 1`).
+  4. Fan: Kencang / Max (`fan: 3`).
+  5. Pastikan power aktif (`power: true`).
+- **Tool Call:**
+  ```json
+  {
+    "name": "control_ac",
+    "arguments": {
+      "power": true,
+      "temp": 22,
+      "mode": 1,
+      "fan": 3
+    }
+  }
+  ```
+
+---
+
+### Contoh Skenario 3: Mematikan AC Kamar secara Idempoten
+- **User:** "Matikan AC kamar sekarang."
+- **LLM Reasoning:** User meminta mematikan AC. Cukup kirim `power: false`. Ini bersifat non-toggle dan tidak akan mengaktifkan AC kembali jika sudah mati.
+- **Tool Call:**
+  ```json
+  {
+    "name": "control_ac",
+    "arguments": {
+      "power": false
+    }
+  }
+  ```
+
+---
+
+### Contoh Skenario 4: Persiapan Tidur (Multi-Target: Saklar + AC + Countdown Timer)
+- **User:** "Saya mau tidur. Matikan saklar lampu kamar (Saklar A), setel AC 25 derajat mode sleep, dan tolong matikan AC otomatis dalam 6 jam."
+- **LLM Reasoning:**
+  1. Matikan Saklar A -> `control_wall_switch(switch_index=0, state="OFF")`.
+  2. Setel AC 25°C mode Sleep -> `control_ac(power=True, temp=25, sleep=True)`.
+  3. Countdown timer 6 jam (6 × 3600 = 21600 detik) untuk mematikan AC (`target_ac: 2`, `target_action: "OFF"`, `target_relays: [false, false, false, false]`, `target_switches: [false, false, false]`).
+- **Tool Calls Berurutan:**
+  ```json
+  {
+    "name": "control_wall_switch",
+    "arguments": { "switch_index": 0, "state": "OFF" }
+  }
+  ```
+  ```json
+  {
+    "name": "control_ac",
+    "arguments": { "power": true, "temp": 25, "sleep": true }
+  }
+  ```
+  ```json
+  {
+    "name": "create_countdown_timer",
+    "arguments": {
+      "duration_sec": 21600,
+      "target_action": "OFF",
+      "target_ac": 2,
+      "target_relays": [false, false, false, false],
+      "target_switches": [false, false, false]
+    }
+  }
+  ```
+
+---
+
+### Contoh Skenario 5: Menyalakan Pompa Selama 15 Menit Lalu Mati Otomatis
 - **User:** "Nyalakan pompa air (Relay 3) selama 15 menit dari sekarang, habis itu matikan."
 - **LLM Reasoning:**
   1. Durasi 15 menit = 15 × 60 = 900 detik.
   2. Beban berada di Relay 3.
   3. Menginginkan pompa hidup sekarang dan mati saat selesai -> gunakan `invert_on_start_end = true` dengan `target_action = "OFF"`.
-  4. Array relay: `[false, false, true, false]`. Array saklar: `[false, false, false]`.
+  4. Array relay: `[false, false, true, false]`. Array saklar: `[false, false, false]`. `target_ac: 0` (abaikan AC).
 - **Tool Call:**
   ```json
   {
@@ -856,6 +1189,7 @@ Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LL
       "duration_sec": 900,
       "invert_on_start_end": true,
       "target_action": "OFF",
+      "target_ac": 0,
       "target_relays": [false, false, true, false],
       "target_switches": [false, false, false]
     }
@@ -864,23 +1198,7 @@ Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LL
 
 ---
 
-### Contoh Skenario 3: Mematikan Saklar Dinding Kamar Tidur
-- **User:** "Matikan saklar dinding kamar (Saklar B)."
-- **LLM Reasoning:** Saklar B memiliki index `1` (karena Saklar A = 0, B = 1, C = 2). State yang diinginkan adalah "OFF".
-- **Tool Call:**
-  ```json
-  {
-    "name": "control_wall_switch",
-    "arguments": {
-      "switch_index": 1,
-      "state": "OFF"
-    }
-  }
-  ```
-
----
-
-### Contoh Skenario 4: Cek Kondisi Sebelum Bertindak
+### Contoh Skenario 6: Cek Kondisi Sebelum Bertindak
 - **User:** "Kira-kira lampu teras (Relay 2) lagi nyala atau mati sekarang?"
 - **LLM Reasoning:** Saya perlu mengetahui status relay saat ini terlebih dahulu sebelum memberikan jawaban akurat ke pengguna.
 - **Tool Call:**
@@ -898,12 +1216,11 @@ Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LL
 
 ---
 
-### Contoh Skenario 5: Menyetel Jadwal Lampu Taman Setiap Malam
-- **User:** "Atur lampu taman di Relay 4 agar menyala otomatis jam 18:00 dan mati jam 06:00 pagi setiap hari."
+### Contoh Skenario 7: Menyetel Jadwal AC Harian Otomatis
+- **User:** "Atur AC menyala otomatis setiap jam 21:00 malam dan mati jam 05:00 pagi setiap hari."
 - **LLM Reasoning:**
-  1. Jam 18:00 WIB -> `h: 18, m: 0, a: "ON", e: true, r: [false, false, false, true], s: [false, false, false]`.
-  2. Jam 06:00 WIB -> `h: 6, m: 0, a: "OFF", e: true, r: [false, false, false, true], s: [false, false, false]`.
-  3. Simpan kedua entri ini ke daftar jadwal.
+  1. Jam 21:00 WIB -> `h: 21, m: 0, a: "ON", e: true, target_ac: 1, r: [false, false, false, false], s: [false, false, false]`.
+  2. Jam 05:00 WIB -> `h: 5, m: 0, a: "OFF", e: true, target_ac: 2, r: [false, false, false, false], s: [false, false, false]`.
 - **Tool Call:**
   ```json
   {
@@ -911,19 +1228,21 @@ Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LL
     "arguments": {
       "schedules": [
         {
-          "h": 18,
+          "h": 21,
           "m": 0,
           "a": "ON",
           "e": true,
-          "r": [false, false, false, true],
+          "target_ac": 1,
+          "r": [false, false, false, false],
           "s": [false, false, false]
         },
         {
-          "h": 6,
+          "h": 5,
           "m": 0,
           "a": "OFF",
           "e": true,
-          "r": [false, false, false, true],
+          "target_ac": 2,
+          "r": [false, false, false, false],
           "s": [false, false, false]
         }
       ]
@@ -933,15 +1252,21 @@ Berikan contoh-contoh berikut pada System Prompt atau konteks percakapan agar LL
 
 ---
 
-## 7. Penanganan Masalah & Safety Guardrails untuk AI
+## 8. Penanganan Masalah & Safety Guardrails untuk AI
 
-1. **Servo Sedang Sibuk (`servoBusy: true`):**
+1. **AC Disabled (Error 403 Forbidden):**
+   - Jika pemanggilan `POST /api/ac` mengembalikan respons `403 Forbidden` (`{"status":"Error","message":"AC Disabled"}`), artinya hardware AC IR dinonaktifkan di konfigurasi hardware perangkat. Informasikan ke pengguna bahwa port hardware AC sedang dimatikan.
+2. **Karakteristik Open-Loop Transmisi IR:**
+   - Sinyal infrared tidak memiliki kanal komunikasi balik dari unit AC fisik ke ESP32. Status AC di `/api/status` mencerminkan *last commanded state* yang berhasil dikirimkan oleh ESP32 dan disimpan ke memori flash.
+3. **Safety Indexing `target_ac`:**
+   - Saat membuat timer atau jadwal yang hanya menargetkan relay atau saklar tembok, pastikan selalu mengisi `target_ac: 0` agar status AC pengguna tidak ikut berubah secara tidak disengaja.
+4. **Servo Sedang Sibuk (`servoBusy: true`):**
    - Jika saat pemanggilan status didapati `servoBusy == true` atau `servoQueueLength > 5`, LLM sebaiknya menunda pengiriman perintah servo beruntun agar tidak membebani antrean FIFO.
-2. **Channel Hardware Nonaktif:**
+5. **Channel Hardware Nonaktif:**
    - Cek `relayActive` dan `switchActive` dari status. Jika channel diminta user sedang dinonaktifkan (`false`), beri tahu user bahwa channel tersebut dinonaktifkan secara konfigurasi hardware sebelum mencoba mengeksekusinya.
-3. **Waktu NTP Belum Sinkron (`time: "Not Synced"`):**
+6. **Waktu NTP Belum Sinkron (`time: "Not Synced"`):**
    - Jika waktu NTP belum sinkron, fungsi timer countdown tetap bekerja normal dengan millis internal, namun penjadwalan jam harian (`schedules`) tidak akan tertrigger sampai ESP32 berhasil memperoleh waktu dari internet.
-4. **Validasi Range Ketat:**
+7. **Validasi Range Ketat:**
    - Selalu validasi agar `channel` relay berada di range 1..4 (bukan 0..3).
    - Selalu validasi agar `switch` index berada di range 0..2 (bukan 1..3).
    - Selalu pastikan durasi timer bernilai positif integer dalam detik.
