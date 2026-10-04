@@ -34,7 +34,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+
+      - name: ⚡ Cache PlatformIO Core & Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-platformio-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-platformio-
 
       - name: 🛠️ Install PlatformIO Core
         run: |
@@ -56,7 +65,8 @@ jobs:
           cp .pio/build/esp32doit-devkit-v1/bootloader.bin build_output/bootloader.bin || true
           cp .pio/build/esp32doit-devkit-v1/partitions.bin build_output/partitions.bin || true
           cd build_output
-          zip -r ../r-sync-esp32-binaries.zip .
+          zip -r r-sync-esp32-binaries.zip .
+          cp r-sync-esp32-binaries.zip ../
 
       - name: 📤 Upload Build Artifact to GitHub Actions
         uses: actions/upload-artifact@v4
